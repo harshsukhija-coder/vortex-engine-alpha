@@ -1,0 +1,14 @@
+services:
+  db:
+    image: pgvector/pgvector:pg14
+    container_name: vortex-db
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - ${DB_PORT}:5432
+    environment:
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA: /data/postgres
+      POSTGRES_DB: ${DB_NAME}
