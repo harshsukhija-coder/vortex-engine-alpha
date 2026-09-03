@@ -2759,7 +2759,13 @@ api.get('/setup-instances/occupancy', async (c) => {
           id: config.id,
           name: config.name,
           consoleType: config.consoleType,
-          chargePerPersonPerHour: config.price
+          chargePerPersonPerHour: config.price,
+          singlePlayerPrice: (config.singlePlayerPrice && config.singlePlayerPrice > 0)
+            ? config.singlePlayerPrice
+            : config.price,
+          multiplayerPrice: (config.multiplayerPrice && config.multiplayerPrice > 0)
+            ? config.multiplayerPrice
+            : config.price
         } : null,
         status,
         currentBooking: activeBooking ? {
