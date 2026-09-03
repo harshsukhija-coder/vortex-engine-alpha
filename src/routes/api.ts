@@ -517,10 +517,13 @@ api.post('/bookings/review', async (c) => {
     );
     if (!config) return c.json({ success: false, error: "Setup active configuration not found" }, 404);
 
+    const pricing = calculatePriceForRule(config, count, noOfHours);
+    const ratePerPersonPerHour = pricing.ratePerPersonPerHour;
+
     const setup = {
       ...setupDb,
       consoleType: config.consoleType,
-      chargePerPersonPerHour: config.price,
+      chargePerPersonPerHour: ratePerPersonPerHour,
       otherNecessaries: config.extendedConfigurations
     };
 
@@ -550,11 +553,13 @@ api.post('/bookings/review', async (c) => {
       gamesList = dbGames.filter(g => gameIds.includes(g.id)).map(g => g.name);
     }
 
-    // 6. Calculate Price Calculations Text (e.g. ₹100 × 2 people × 2 hrs)
-    const priceCalculationText = `₹${setup.chargePerPersonPerHour} × ${count} people × ${durationHours} hrs`;
+    // 6. Calculate Price Calculations Text (same single vs multi rates as /price)
+    const priceCalculationText = count === 1
+      ? `₹${ratePerPersonPerHour} × 1 player × ${durationHours} hrs`
+      : `₹${ratePerPersonPerHour} × ${count} people × ${durationHours} hrs`;
 
     // 7. Calculate Pricing & Offers
-    const originalAmount = Math.ceil(durationHours * setup.chargePerPersonPerHour * count);
+    const originalAmount = pricing.basePrice;
 
     const activeOffers = await db.select().from(offerTable).where(eq(offerTable.isActive, true));
     const offerDetails = await db.select().from(offerDetailsTable);

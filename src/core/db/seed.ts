@@ -363,7 +363,8 @@ async function seed() {
     { email: 'admin@cafe.com', password: 'adminsecret', role: 'ADMIN' as const },
     { email: 'member@cafe.com', password: 'membersecret', role: 'MEMBER' as const },
     { email: 'meet@gmail.com', password: 'Meet@1234', role: 'SUPER_ADMIN' as const },
-    { email: 'harsh@gmail.com', password: 'Harsh@1234', role: 'ADMIN' as const }
+    { email: 'harsh@gmail.com', password: 'Harsh@1234', role: 'ADMIN' as const },
+    { email: 'ravi@gmail.com', password: 'Ravi@1234', role: 'ADMIN' as const }
   ];
 
   for (const u of usersList) {

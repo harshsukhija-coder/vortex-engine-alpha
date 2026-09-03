@@ -6,6 +6,7 @@ import env from './core/env.js'
 
 import api from './routes/api.js'
 import auth from './routes/auth.js'
+import schedule from './routes/schedule.js'
 
 export const app = new Hono()
   .use(pinoLogger({ pino: { level: env.LOG_LEVEL } }))
@@ -13,6 +14,7 @@ export const app = new Hono()
 
 app.route('/api', api)
 app.route('/api', auth)
+app.route('/api', schedule)
 
 app.get('/', (c) => {
   return c.text('Hello Hono!');
