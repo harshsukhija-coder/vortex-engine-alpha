@@ -6,7 +6,6 @@ import {
   setupConfigurationsTable,
   setupGamesTable,
   offerTable,
-  offerDetailsTable,
   bookingTable,
   bookingAndGames,
   bookingAndOffersTable,
@@ -21,12 +20,28 @@ import * as z from 'zod';
 import { authMiddleware, requireRole } from '../middlewares/auth.js';
 import { verify } from 'hono/jwt';
 import env from '../core/env.js';
-import { evaluateOffers } from '../core/offers.js';
 import { calculatePriceForRule } from '../core/pricing.js';
 
 const api = new Hono();
 
 class BookingConflictError extends Error {}
+
+const HARDCODED_OFFERS = [
+  {
+    id: 1,
+    code: "PLAY_2_GET_1_FREE",
+    name: "PLAY 2, GET 1 FREE",
+    description: "Bring 2 players and the 3rd player joins FREE on the same PS5.",
+    offerType: "EXCLUSIVE" as const
+  },
+  {
+    id: 2,
+    code: "HAPPY_HOURS_MON_THU",
+    name: "HAPPY HOURS — MON–THU | 11 AM–5 PM",
+    description: "Rs 60 per hour multiplayer; Rs 70 per hour single player",
+    offerType: "EXCLUSIVE" as const
+  }
+] as const;
 
 interface BookingInterval {
   startTime: Date;
@@ -286,31 +301,12 @@ api.get(
   }
 );
 
-// 3. GET /api/offers - List all active offers and details
+// 3. GET /api/offers - List the hardcoded promotions
 api.get('/offers', async (c) => {
-  try {
-    const offers = await db
-      .select()
-      .from(offerTable)
-      .where(eq(offerTable.isActive, true));
-
-    const details = await db
-      .select()
-      .from(offerDetailsTable);
-
-    const result = offers.map((offer) => {
-      const offerDetails = details.filter((d) => d.offerId === offer.id);
-      return {
-        ...offer,
-        details: offerDetails
-      };
-    });
-
-    return c.json({ success: true, offers: result });
-  } catch (error: any) {
-    console.error(error);
-    return c.json({ success: false, error: error.message }, 500);
-  }
+  return c.json({
+    success: true,
+    offers: HARDCODED_OFFERS
+  });
 });
 
 // Validation schema for offer evaluation (accepts both nested frontend payload and flat payload)
@@ -355,8 +351,9 @@ function evaluatePromotions(params: {
   dateStr: string;
   startTimeStr: string;
   durationHours: number;
+  selectedOfferIds?: number[];
 }) {
-  const { setup, playersCount, dateStr, startTimeStr, durationHours } = params;
+  const { setup, playersCount, dateStr, startTimeStr, durationHours, selectedOfferIds } = params;
 
   // Determine standard rate
   const isSingle = playersCount === 1;
@@ -373,10 +370,7 @@ function evaluatePromotions(params: {
     : 0;
 
   const offer1 = {
-    id: 1,
-    code: "PLAY_2_GET_1_FREE",
-    name: "PLAY 2, GET 1 FREE",
-    description: "Bring 2 players and the 3rd player joins FREE on the same PS5.",
+    ...HARDCODED_OFFERS[0],
     eligible: play2Get1Eligible,
     discount: play2Get1Discount,
     finalAmount: Math.max(0, originalAmount - play2Get1Discount),
@@ -418,10 +412,7 @@ function evaluatePromotions(params: {
   const happyHourDiscount = happyHoursEligible ? Math.max(0, originalAmount - happyHourTotal) : 0;
 
   const offer2 = {
-    id: 2,
-    code: "HAPPY_HOURS_MON_THU",
-    name: "HAPPY HOURS — MON–THU | 11 AM–5 PM",
-    description: "Rs 60 per hour multiplayer; Rs 70 per hour single player",
+    ...HARDCODED_OFFERS[1],
     eligible: happyHoursEligible,
     discount: happyHourDiscount,
     finalAmount: Math.max(0, originalAmount - happyHourDiscount),
@@ -433,12 +424,22 @@ function evaluatePromotions(params: {
   const offers = [offer1, offer2];
   const applicableOffers = offers.filter((o) => o.eligible);
   const ineligibleOffers = offers.filter((o) => !o.eligible);
+  const selectedOffers = applicableOffers.filter(
+    (offer) => !selectedOfferIds || selectedOfferIds.includes(offer.id)
+  );
+  const appliedOffers = selectedOffers
+    .sort((a, b) => b.discount - a.discount)
+    .slice(0, 1);
+  const discountApplied = appliedOffers.reduce((sum, offer) => sum + offer.discount, 0);
 
   return {
     originalAmount,
+    discountApplied,
+    totalAmount: Math.max(0, originalAmount - discountApplied),
     ratePerPersonPerHour,
     durationHours,
     playersCount,
+    appliedOffers,
     applicableOffers,
     ineligibleOffers,
     offers
@@ -487,18 +488,12 @@ async function handleOffersEvaluation(c: any) {
     };
 
     const pricing = calculatePriceForRule(config, playersCount, durationHours);
-    const [activeOffers, offerDetails] = await Promise.all([
-      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
-      db.select().from(offerDetailsTable)
-    ]);
-    const evaluation = evaluateOffers({
-      offers: activeOffers,
-      details: offerDetails,
-      originalAmount: pricing.basePrice,
-      players: playersCount,
+    const evaluation = evaluatePromotions({
+      setup,
+      playersCount,
+      dateStr,
+      startTimeStr,
       durationHours,
-      ratePerPersonPerHour: pricing.ratePerPersonPerHour,
-      gameIds: bDetails.gameIds ?? data.gameIds ?? [],
       selectedOfferIds: data.appliedOfferIds
     });
 
@@ -605,18 +600,19 @@ api.post('/bookings/review', async (c) => {
     // 7. Calculate Pricing & Offers
     const originalAmount = pricing.basePrice;
 
-    const [activeOffers, offerDetails] = await Promise.all([
-      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
-      db.select().from(offerDetailsTable)
-    ]);
-    const offerEvaluation = evaluateOffers({
-      offers: activeOffers,
-      details: offerDetails,
-      originalAmount,
-      players: count,
+    const offerEvaluation = evaluatePromotions({
+      setup: {
+        id: config.id,
+        name: config.name,
+        consoleType: config.consoleType,
+        price: config.price,
+        singlePlayerPrice: config.singlePlayerPrice,
+        multiplayerPrice: config.multiplayerPrice
+      },
+      playersCount: count,
+      dateStr: date,
+      startTimeStr: startTime,
       durationHours,
-      ratePerPersonPerHour,
-      gameIds,
       selectedOfferIds: appliedOfferIds
     });
 
@@ -761,18 +757,19 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     const selectedOfferIds = data.appliedOfferIds
       ?? data.offers?.appliedOfferIds
       ?? data.offers?.appliedOffers?.flatMap((offer) => offer.id ? [offer.id] : []);
-    const [activeOffers, offerDetails] = await Promise.all([
-      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
-      db.select().from(offerDetailsTable)
-    ]);
-    const offerEvaluation = evaluateOffers({
-      offers: activeOffers,
-      details: offerDetails,
-      originalAmount,
-      players: count,
+    const offerEvaluation = evaluatePromotions({
+      setup: {
+        id: config.id,
+        name: config.name,
+        consoleType: config.consoleType,
+        price: config.price,
+        singlePlayerPrice: config.singlePlayerPrice,
+        multiplayerPrice: config.multiplayerPrice
+      },
+      playersCount: count,
+      dateStr: date,
+      startTimeStr: startTime,
       durationHours,
-      ratePerPersonPerHour,
-      gameIds,
       selectedOfferIds
     });
     const discountApplied = offerEvaluation.discountApplied;
@@ -955,6 +952,9 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           upiAmount: booking.upiAmount
         },
         appliedOffers,
+        applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
+        ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible),
+        offers: offerEvaluation.offers,
         bookedByAdmin: adminUser ? {
           id: adminUser.id,
           email: adminUser.email,
@@ -1033,18 +1033,19 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
     // 2. Calculate Base Pricing
     const originalAmount = pricing.basePrice;
 
-    const [activeOffers, offerDetails] = await Promise.all([
-      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
-      db.select().from(offerDetailsTable)
-    ]);
-    const offerEvaluation = evaluateOffers({
-      offers: activeOffers,
-      details: offerDetails,
-      originalAmount,
-      players: count,
+    const offerEvaluation = evaluatePromotions({
+      setup: {
+        id: config.id,
+        name: config.name,
+        consoleType: config.consoleType,
+        price: config.price,
+        singlePlayerPrice: config.singlePlayerPrice,
+        multiplayerPrice: config.multiplayerPrice
+      },
+      playersCount: count,
+      dateStr: date,
+      startTimeStr: startTime,
       durationHours,
-      ratePerPersonPerHour: pricing.ratePerPersonPerHour,
-      gameIds,
       selectedOfferIds: appliedOfferIds
     });
     const amountCharged = offerEvaluation.totalAmount;
@@ -1090,6 +1091,9 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
       booking: {
         ...tentativeBooking,
         appliedOffers,
+        applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
+        ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible),
+        offers: offerEvaluation.offers,
         gamesBooked: gameIds || [],
         setupSnapshot,
         pricing: {
@@ -1151,12 +1155,49 @@ api.get('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMI
 
     return c.json({
       success: true,
-      bookings: bookings.map((booking) => ({
-        ...booking,
-        setupConfiguration: configurations.find(
-          (configuration) => configuration.id === booking.setupConfigurationId
-        ) ?? null
-      }))
+      bookings: bookings.map((booking) => {
+        const snapshot = booking.setupSnapshot as {
+          name?: string;
+          consoleType?: string;
+          price?: number;
+          singlePlayerPrice?: number;
+          multiplayerPrice?: number;
+          chargePerPersonPerHour?: unknown;
+        } | null;
+        const durationHours = booking.requestedNoOfHours
+          ?? (booking.endTime.getTime() - booking.startTime.getTime()) / (60 * 60 * 1000);
+        const offerEvaluation = evaluatePromotions({
+          setup: {
+            id: booking.setupConfigurationId,
+            name: snapshot?.name ?? 'Setup',
+            consoleType: snapshot?.consoleType ?? 'Console',
+            price: snapshot?.price ?? 0,
+            singlePlayerPrice: snapshot?.singlePlayerPrice,
+            multiplayerPrice: snapshot?.multiplayerPrice
+          },
+          playersCount: booking.count,
+          dateStr: booking.startTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
+          startTimeStr: booking.startTime.toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+            timeZone: 'Asia/Kolkata'
+          }),
+          durationHours,
+          selectedOfferIds: booking.appliedOfferIds
+        });
+
+        return {
+          ...booking,
+          setupConfiguration: configurations.find(
+            (configuration) => configuration.id === booking.setupConfigurationId
+          ) ?? null,
+          appliedOffers: offerEvaluation.appliedOffers,
+          applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
+          ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible),
+          offers: offerEvaluation.offers
+        };
+      })
     });
   } catch (error: any) {
     console.error(error);
@@ -1477,11 +1518,14 @@ api.patch('/bookings/:id/status', authMiddleware, requireRole(['ADMIN', 'SUPER_A
       .where(eq(bookingAndGames.bookingId, updated.id));
     const gamesList = games.map(g => g.name);
 
-    const offers = await db
-      .select({ id: offerTable.id, name: offerTable.name })
+    const linkedOfferIds = await db
+      .select({ offerId: bookingAndOffersTable.offerId })
       .from(bookingAndOffersTable)
-      .innerJoin(offerTable, eq(bookingAndOffersTable.offerId, offerTable.id))
       .where(eq(bookingAndOffersTable.bookingId, updated.id));
+    const offers = linkedOfferIds.flatMap(({ offerId }) => {
+      const offer = HARDCODED_OFFERS.find((candidate) => candidate.id === offerId);
+      return offer ? [{ id: offer.id, name: offer.name }] : [];
+    });
 
     // Use requestedStartTime + requestedNoOfHours (what the customer booked)
     // Fall back to startTime/endTime if explicit fields are missing
@@ -1640,23 +1684,31 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
 
     // 2. Pricing & Offers Calculation for total extended session
     const newOriginalAmount = Math.ceil(totalDurationHours * ratePerPersonPerHour * count);
-    const [activeOffers, offerDetails, bookedGames, existingBookingOffers] = await Promise.all([
-      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
-      db.select().from(offerDetailsTable),
-      db.select({ gameId: bookingAndGames.gameId }).from(bookingAndGames).where(eq(bookingAndGames.bookingId, id)),
-      db.select({ offerId: bookingAndOffersTable.offerId }).from(bookingAndOffersTable).where(eq(bookingAndOffersTable.bookingId, id))
-    ]);
+    const existingBookingOffers = await db
+      .select({ offerId: bookingAndOffersTable.offerId })
+      .from(bookingAndOffersTable)
+      .where(eq(bookingAndOffersTable.bookingId, id));
     const targetOfferIds = data.offers?.appliedOfferIds
       ?? data.appliedOfferIds
       ?? existingBookingOffers.map((offer) => offer.offerId);
-    const offerEvaluation = evaluateOffers({
-      offers: activeOffers,
-      details: offerDetails,
-      originalAmount: newOriginalAmount,
-      players: count,
+    const offerEvaluation = evaluatePromotions({
+      setup: {
+        id: Number(snapshot.setupConfigurationId ?? setupId),
+        name: String(snapshot.name ?? snapshot.instanceName ?? 'Setup'),
+        consoleType: String(snapshot.consoleType ?? 'Console'),
+        price: Number(snapshot.price ?? ratePerPersonPerHour),
+        singlePlayerPrice: Number(singlePrice),
+        multiplayerPrice: Number(multiPrice)
+      },
+      playersCount: count,
+      dateStr: currentStartTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
+      startTimeStr: currentStartTime.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'Asia/Kolkata'
+      }),
       durationHours: totalDurationHours,
-      ratePerPersonPerHour,
-      gameIds: bookedGames.map((game) => game.gameId),
       selectedOfferIds: targetOfferIds.length > 0 ? targetOfferIds : undefined
     });
     const appliedOffers = offerEvaluation.appliedOffers;
@@ -1866,20 +1918,28 @@ async function handleEndSessionLogic(params: {
   // Recalculate original base amount for actual duration
   const finalOriginalAmount = Math.ceil(actualDurationHours * ratePerPersonPerHour * count);
 
-  const [activeOffers, offerDetails, bookedGames, existingBookingOffers] = await Promise.all([
-    db.select().from(offerTable).where(eq(offerTable.isActive, true)),
-    db.select().from(offerDetailsTable),
-    db.select({ gameId: bookingAndGames.gameId }).from(bookingAndGames).where(eq(bookingAndGames.bookingId, booking.id)),
-    db.select({ offerId: bookingAndOffersTable.offerId }).from(bookingAndOffersTable).where(eq(bookingAndOffersTable.bookingId, booking.id))
-  ]);
-  const offerEvaluation = evaluateOffers({
-    offers: activeOffers,
-    details: offerDetails,
-    originalAmount: finalOriginalAmount,
-    players: count,
+  const existingBookingOffers = await db
+    .select({ offerId: bookingAndOffersTable.offerId })
+    .from(bookingAndOffersTable)
+    .where(eq(bookingAndOffersTable.bookingId, booking.id));
+  const offerEvaluation = evaluatePromotions({
+    setup: {
+      id: Number(snapshot.setupConfigurationId ?? booking.setupId ?? 0),
+      name: String(snapshot.name ?? snapshot.instanceName ?? 'Setup'),
+      consoleType: String(snapshot.consoleType ?? 'Console'),
+      price: Number(snapshot.price ?? ratePerPersonPerHour),
+      singlePlayerPrice: Number(singlePrice),
+      multiplayerPrice: Number(multiPrice)
+    },
+    playersCount: count,
+    dateStr: actualStartTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
+    startTimeStr: actualStartTime.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+      timeZone: 'Asia/Kolkata'
+    }),
     durationHours: actualDurationHours,
-    ratePerPersonPerHour,
-    gameIds: bookedGames.map((game) => game.gameId),
     selectedOfferIds: existingBookingOffers.length > 0
       ? existingBookingOffers.map((offer) => offer.offerId)
       : undefined
@@ -2121,70 +2181,31 @@ api.post('/bookings/:id/apply-discount', authMiddleware, requireRole(['ADMIN', '
     const durationHours = Math.max(0.25, (new Date(endTime).getTime() - new Date(startTime).getTime()) / (1000 * 60 * 60));
 
     const count = booking.count;
-    const originalAmount = booking.originalAmount || 0;
 
-    // 2. Fetch active target offers from DB
-    let targetOffers: any[] = [];
-    if (offerIds.length > 0) {
-      targetOffers = await db
-        .select()
-        .from(offerTable)
-        .where(and(eq(offerTable.isActive, true), inArray(offerTable.id, offerIds)));
-    }
-
-    const offerDetails = await db.select().from(offerDetailsTable);
-
-    let amountCharged = originalAmount;
-    const appliedPromotions: Array<{ id: number; name: string; discount: number }> = [];
-
-    for (const offer of targetOffers) {
-      const details = offerDetails.filter((d) => d.offerId === offer.id);
-      let isApplicable = true;
-
-      // Check conditions
-      for (const d of details) {
-        if (d.condObj === 'amount') {
-          const thresh = d.condValue ? parseFloat(d.condValue) : 0;
-          if (d.cond === '>' && !(originalAmount > thresh)) isApplicable = false;
-          if (d.cond === '>=' && !(originalAmount >= thresh)) isApplicable = false;
-        } else if (d.condObj === 'person') {
-          const thresh = d.condValue ? parseInt(d.condValue, 10) : 0;
-          if (d.cond === '>=' && !(count >= thresh)) isApplicable = false;
-          if (d.cond === '>' && !(count > thresh)) isApplicable = false;
-        }
-      }
-
-      if (isApplicable) {
-        let discountAmount = 0;
-        for (const d of details) {
-          if (d.offerObj === 'amount') {
-            const valStr = d.offerValue || "0";
-            if (valStr.endsWith('%')) {
-              const pct = parseFloat(valStr.slice(0, -1)) / 100;
-              discountAmount += Math.ceil(amountCharged * pct);
-            } else {
-              discountAmount += parseFloat(valStr);
-            }
-          } else if (d.offerObj === 'person') {
-            const freeCount = Math.floor(count / 2);
-            const singlePersonShare = durationHours * chargePerPersonPerHour;
-            discountAmount += Math.ceil(freeCount * singlePersonShare);
-          }
-        }
-
-        if (discountAmount > 0) {
-          amountCharged = Math.max(0, amountCharged - discountAmount);
-          appliedPromotions.push({
-            id: offer.id,
-            name: offer.name,
-            discount: discountAmount
-          });
-          if (offer.offerType === 'EXCLUSIVE') {
-            break;
-          }
-        }
-      }
-    }
+    // 2. Evaluate the hardcoded promotions against the booking.
+    const startDate = new Date(startTime);
+    const offerEvaluation = evaluatePromotions({
+      setup: {
+        id: Number(snapshot?.setupConfigurationId ?? booking.setupId ?? 0),
+        name: String(snapshot?.name ?? snapshot?.instanceName ?? 'Setup'),
+        consoleType: String(snapshot?.consoleType ?? 'Console'),
+        price: Number(snapshot?.price ?? chargePerPersonPerHour),
+        singlePlayerPrice: Number(snapshot?.singlePlayerPrice ?? chargePerPersonPerHour),
+        multiplayerPrice: Number(snapshot?.multiplayerPrice ?? chargePerPersonPerHour)
+      },
+      playersCount: count,
+      dateStr: startDate.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
+      startTimeStr: startDate.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'Asia/Kolkata'
+      }),
+      durationHours,
+      selectedOfferIds: offerIds
+    });
+    const amountCharged = offerEvaluation.totalAmount;
+    const appliedPromotions = offerEvaluation.appliedOffers;
 
     // 3. Write updates inside transaction
     const updatedBooking = await db.transaction(async (tx) => {
@@ -2907,21 +2928,22 @@ api.get('/sessions/past', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']),
       const linkedOffers = await db
         .select({
           bookingId: bookingAndOffersTable.bookingId,
-          offer: {
-            id: offerTable.id,
-            name: offerTable.name,
-            offerType: offerTable.offerType
-          }
+          offerId: bookingAndOffersTable.offerId
         })
         .from(bookingAndOffersTable)
-        .innerJoin(offerTable, eq(bookingAndOffersTable.offerId, offerTable.id))
         .where(inArray(bookingAndOffersTable.bookingId, bookingIds));
 
       for (const item of linkedOffers) {
+        const offer = HARDCODED_OFFERS.find((candidate) => candidate.id === item.offerId);
+        if (!offer) continue;
         if (!offersByBookingId[item.bookingId]) {
           offersByBookingId[item.bookingId] = [];
         }
-        offersByBookingId[item.bookingId].push(item.offer);
+        offersByBookingId[item.bookingId].push({
+          id: offer.id,
+          name: offer.name,
+          offerType: offer.offerType
+        });
       }
     }
 
