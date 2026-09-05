@@ -2279,7 +2279,7 @@ const lockIntervalSchema = z.object({
   noOfHours: z.number().int().positive("noOfHours must be at least 1")
 });
 
-// 5a. GET /api/slots/available - List booked and locked intervals for a setup on a date (Public)
+// 5a. GET /api/slots/available - List all bookable slots for a setup on a date (Public)
 api.get('/slots/available', async (c) => {
   try {
     const query = c.req.query();
@@ -2287,7 +2287,7 @@ api.get('/slots/available', async (c) => {
     if (!validated.success) {
       return c.json({ success: false, error: "Invalid query parameters", details: validated.error.format() }, 400);
     }
-    const { date, setupConfigurationId, lockToken } = validated.data;
+    const { date, setupConfigurationId } = validated.data;
 
     const [config] = await db
       .select()
@@ -2295,113 +2295,32 @@ api.get('/slots/available', async (c) => {
       .where(eq(setupConfigurationsTable.id, setupConfigurationId));
     if (!config) return c.json({ success: false, error: "Setup configuration not found" }, 404);
 
-    const instances = await db.select().from(setupsTable).where(
-      and(
-        eq(setupsTable.setupConfigurationId, setupConfigurationId),
-        eq(setupsTable.isActive, true)
-      )
-    );
-    const targetInstanceIds = instances.map((instance) => instance.id);
-    const targetConfigurationIds = [setupConfigurationId];
-
-    if (targetInstanceIds.length === 0) {
-      return c.json({
-        success: true,
-        date,
-        bookedIntervals: [],
-        tentativeIntervals: [],
-        lockedIntervals: []
-      });
-    }
-
-    const dayStart = new Date(`${date}T00:00:00+05:30`);
-    const dayEnd = new Date(`${date}T23:59:59+05:30`);
-
-    // Fetch overlapping bookings (confirmed)
-    const bookedIntervals = await db
-      .select({
-        startTime: bookingTable.startTime,
-        endTime: bookingTable.endTime,
-        setupInstanceId: bookingTable.setupId,
-        status: bookingTable.status
-      })
-      .from(bookingTable)
-      .where(
-        and(
-          inArray(bookingTable.setupId, targetInstanceIds),
-          lt(bookingTable.startTime, dayEnd),
-          gt(bookingTable.endTime, dayStart),
-          ne(bookingTable.status, 'CANCELLED')
-        )
-      );
-
-    // Fetch overlapping bookings (tentative)
-    const tentativeIntervals = await db
-      .select({
-        startTime: tentativeBookingTable.startTime,
-        endTime: tentativeBookingTable.endTime,
-        setupConfigurationId: tentativeBookingTable.setupConfigurationId
-      })
-      .from(tentativeBookingTable)
-      .where(
-        and(
-          inArray(tentativeBookingTable.setupConfigurationId, targetConfigurationIds),
-          lt(tentativeBookingTable.startTime, dayEnd),
-          gt(tentativeBookingTable.endTime, dayStart)
-        )
-      );
-
-    // Fetch overlapping active locks
-    const activeLocks = await db
-      .select({
-        startTime: slotLocksTable.startTime,
-        endTime: slotLocksTable.endTime,
-        lockToken: slotLocksTable.lockToken,
-        lockedUntil: slotLocksTable.lockedUntil,
-        setupInstanceId: slotLocksTable.setupId
-      })
-      .from(slotLocksTable)
-      .where(
-        and(
-          inArray(slotLocksTable.setupId, targetInstanceIds),
-          eq(slotLocksTable.slotDate, date),
-          gt(slotLocksTable.lockedUntil, new Date())
-        )
-      );
-
-    const formattedBooked = bookedIntervals.map(b => ({
-        startTime: b.startTime.toISOString(),
-        endTime: b.endTime.toISOString(),
-        status: b.status,
-        startTimeFormatted: b.startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
-        endTimeFormatted: b.endTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })
-      }));
-    const formattedTentative = tentativeIntervals.map(t => ({
-        setupConfigurationId: t.setupConfigurationId,
-        startTime: t.startTime.toISOString(),
-        endTime: t.endTime.toISOString(),
-        status: 'TENTATIVE',
-        startTimeFormatted: t.startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
-        endTimeFormatted: t.endTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })
-      }));
-
-    const formattedLocked = activeLocks
-      .filter(l => !lockToken || l.lockToken !== lockToken)
-      .map(l => ({
-        startTime: l.startTime.toISOString(),
-        endTime: l.endTime.toISOString(),
-        startTimeFormatted: l.startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
-        endTimeFormatted: l.endTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
-        lockedUntil: l.lockedUntil.toISOString()
-      }));
+    const slots = getSlotsForDate(date).map((slot) => ({
+      startTime: slot.startTime.toISOString(),
+      endTime: slot.endTime.toISOString(),
+      startTimeFormatted: slot.startTime.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'Asia/Kolkata'
+      }),
+      endTimeFormatted: slot.endTime.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'Asia/Kolkata'
+      }),
+      status: 'AVAILABLE'
+    }));
 
     return c.json({
       success: true,
       date,
       setupConfigurationId,
-      bookedIntervals: formattedBooked,
-      tentativeIntervals: formattedTentative,
-      lockedIntervals: formattedLocked
+      slots,
+      bookedIntervals: [],
+      tentativeIntervals: [],
+      lockedIntervals: []
     });
   } catch (error: any) {
     console.error(error);
