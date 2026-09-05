@@ -70,6 +70,30 @@ async function seed() {
         'https://i0.wp.com/www.qualbert.com/wp-content/uploads/2023/10/MK1-wallpaper.jpg?fit=1149%2C646&ssl=1',
         'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTaQZpHQC0bzX_tELtHykSxHuB28ejbFESDgZFjiqqfg7c3kOpsHwB-aq5m&s=10'
       ]
+    },
+    {
+      name: 'Spiderman',
+      price: 0,
+      isActive: true,
+      images: [
+        'https://m.media-amazon.com/images/I/810mqhjfWhL.jpg'
+      ]
+    },
+    {
+      name: 'God of war',
+      price: 0,
+      isActive: true,
+      images: [
+        'https://m.media-amazon.com/images/I/613lyxBIXoL._AC_UF894,1000_QL80_.jpg'
+      ]
+    },
+    {
+      name: 'Other',
+      price: 0,
+      isActive: true,
+      images: [
+        'https://preview.redd.it/ps5-game-collection-v0-yn91ldnm1k2d1.jpeg?auto=webp&s=45a9337658754369f2df11e9bc462240708eaef1'
+      ]
     }
   ];
 
@@ -222,66 +246,22 @@ async function seed() {
   }
 
   // 3. Associate Games with Configurations (Setup Games)
-  console.log('Associating games with setup configurations...');
-  const set1Games = [
-    'FC 26',
-    'Wwe 2k26',
-    'Cricket24',
-    'Tekken8',
-    'GTA 5',
-    'Uncharted',
-    'Mortal Kombat'
-  ];
+  console.log('Associating every game with every setup configuration...');
+  const setupGameMappings = Object.values(seededConfigs).flatMap(
+    (setupConfigurationId) =>
+      Object.values(seededGames).map((gameId) => ({
+        setupConfigurationId,
+        gameId
+      }))
+  );
 
-  const set2Games = [
-    'FC 26',
-    'Wwe 2k26',
-    'Mortal Kombat',
-    'Tekken8',
-    'GTA 5'
-  ];
-
-  // Big Screen (65") associations
-  const set1Id = seededConfigs['Big Screen (65")'];
-  if (set1Id) {
-    for (const gameName of set1Games) {
-      const gameId = seededGames[gameName];
-      if (gameId) {
-        try {
-          await db
-            .insert(setupGamesTable)
-            .values({
-              setupConfigurationId: set1Id,
-              gameId: gameId
-            });
-          console.log(`Mapped game "${gameName}" to Configuration Big Screen (65")`);
-        } catch (error) {
-          // Already mapped or duplicate error, ignore
-        }
-      }
-    }
+  if (setupGameMappings.length > 0) {
+    await db
+      .insert(setupGamesTable)
+      .values(setupGameMappings)
+      .onConflictDoNothing();
   }
-
-  // Standard Screen (55") associations
-  const set2Id = seededConfigs['Standard Screen (55")'];
-  if (set2Id) {
-    for (const gameName of set2Games) {
-      const gameId = seededGames[gameName];
-      if (gameId) {
-        try {
-          await db
-            .insert(setupGamesTable)
-            .values({
-              setupConfigurationId: set2Id,
-              gameId: gameId
-            });
-          console.log(`Mapped game "${gameName}" to Configuration Standard Screen (55")`);
-        } catch (error) {
-          // Already mapped, ignore
-        }
-      }
-    }
-  }
+  console.log(`Ensured ${setupGameMappings.length} setup-game associations.`);
 
   // 4. Seed Opening Offer
   console.log('Seeding opening offer...');
