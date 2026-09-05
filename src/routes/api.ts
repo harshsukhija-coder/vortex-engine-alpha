@@ -1007,7 +1007,6 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
     }
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
     const userId = data.userId;
-    const lockToken = data.lockToken;
     const appliedOfferIds = data.appliedOfferIds ?? data.offers?.appliedOfferIds;
 
     // 1. Fetch the requested configuration. A physical instance is assigned only on confirmation.
@@ -1023,19 +1022,6 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
 
     if (!config) {
       return c.json({ success: false, error: "Setup configuration not found or is currently not active" }, 404);
-    }
-
-    const configurationInstances = await db
-      .select()
-      .from(setupsTable)
-      .where(
-        and(
-          eq(setupsTable.setupConfigurationId, setupConfigurationId),
-          eq(setupsTable.isActive, true)
-        )
-      );
-    if (configurationInstances.length === 0) {
-      return c.json({ success: false, error: "Setup configuration has no active instances" }, 409);
     }
 
     const pricing = calculatePriceForRule(config, count, noOfHours);
@@ -1079,112 +1065,25 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
       snapshotAt: new Date().toISOString()
     };
 
-    // 5. Use database transaction to check overlap and insert tentative booking
-    const tentativeBooking = await db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(${setupConfigurationId})`);
-
-      const instanceIds = configurationInstances.map((instance) => instance.id);
-      const confirmedIntervals = await tx
-        .select({
-          startTime: bookingTable.startTime,
-          endTime: bookingTable.endTime
-        })
-        .from(bookingTable)
-        .where(
-          and(
-            inArray(bookingTable.setupId, instanceIds),
-            lt(bookingTable.startTime, maxEnd),
-            gt(bookingTable.endTime, minStart),
-            ne(bookingTable.status, 'CANCELLED')
-          )
-        );
-
-      const tentativeIntervals = await tx
-        .select({
-          startTime: tentativeBookingTable.startTime,
-          endTime: tentativeBookingTable.endTime
-        })
-        .from(tentativeBookingTable)
-        .where(
-          and(
-            eq(tentativeBookingTable.setupConfigurationId, setupConfigurationId),
-            lt(tentativeBookingTable.startTime, maxEnd),
-            gt(tentativeBookingTable.endTime, minStart)
-          )
-        );
-
-      const activeLocks = await tx
-        .select({
-          id: slotLocksTable.id,
-          userId: slotLocksTable.userId,
-          lockToken: slotLocksTable.lockToken,
-          startTime: slotLocksTable.startTime,
-          endTime: slotLocksTable.endTime
-        })
-        .from(slotLocksTable)
-        .where(
-          and(
-            inArray(slotLocksTable.setupId, instanceIds),
-            lt(slotLocksTable.startTime, maxEnd),
-            gt(slotLocksTable.endTime, minStart),
-            gt(slotLocksTable.lockedUntil, new Date())
-          )
-        );
-
-      const ownedLocks = activeLocks.filter((activeLock) => {
-        const belongsToCheckout = lockToken
-          ? activeLock.lockToken === lockToken
-          : adminId !== undefined && activeLock.userId === adminId;
-        return (
-          belongsToCheckout &&
-          activeLock.startTime <= minStart &&
-          activeLock.endTime >= maxEnd
-        );
-      });
-      if (lockToken && ownedLocks.length === 0) {
-        throw new BookingConflictError("The slot lock is missing, expired, or does not cover the requested interval.");
-      }
-      const ownedLockIds = new Set(ownedLocks.map((ownedLock) => ownedLock.id));
-      const lockIntervals = activeLocks.filter((activeLock) => !ownedLockIds.has(activeLock.id));
-
-      const hasCapacity = hasConfigurationCapacity(
-        [...confirmedIntervals, ...tentativeIntervals, ...lockIntervals],
-        minStart,
-        maxEnd,
-        configurationInstances.length
-      );
-      if (!hasCapacity) {
-        throw new BookingConflictError("No setup instance is available for this configuration and interval.");
-      }
-
-      const [insertedTentative] = await tx
-        .insert(tentativeBookingTable)
-        .values({
-          phoneNumber,
-          setupConfigurationId,
-          userId: userId || adminId || null,
-          bookedBy: adminId || null,
-          count,
-          originalAmount,
-          amountCharged,
-          startTime: minStart,
-          endTime: maxEnd,
-          requestedStartTime: minStart,
-          requestedNoOfHours: noOfHours,
-          setupSnapshot,
-          gameIds: gameIds || [],
-          appliedOfferIds: appliedOffers.map(o => o.id)
-        })
-        .returning();
-
-      if (ownedLocks.length > 0) {
-        await tx
-          .delete(slotLocksTable)
-          .where(inArray(slotLocksTable.id, [...ownedLockIds]));
-      }
-
-      return insertedTentative;
-    });
+    const [tentativeBooking] = await db
+      .insert(tentativeBookingTable)
+      .values({
+        phoneNumber,
+        setupConfigurationId,
+        userId: userId || adminId || null,
+        bookedBy: adminId || null,
+        count,
+        originalAmount,
+        amountCharged,
+        startTime: minStart,
+        endTime: maxEnd,
+        requestedStartTime: minStart,
+        requestedNoOfHours: noOfHours,
+        setupSnapshot,
+        gameIds: gameIds || [],
+        appliedOfferIds: appliedOffers.map((offer) => offer.id)
+      })
+      .returning();
 
     return c.json({
       success: true,
@@ -1344,21 +1243,6 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
 
       if (overlappingBooking) {
         throw new Error("Cannot confirm: The requested slot overlaps with an existing confirmed booking.");
-      }
-
-      const [overlappingLock] = await tx
-        .select()
-        .from(slotLocksTable)
-        .where(
-          and(
-            eq(slotLocksTable.setupId, setupInstanceId),
-            lt(slotLocksTable.startTime, finalEndTime),
-            gt(slotLocksTable.endTime, finalStartTime),
-            gt(slotLocksTable.lockedUntil, new Date())
-          )
-        );
-      if (overlappingLock) {
-        throw new Error("Cannot confirm: The requested setup instance is temporarily locked.");
       }
 
       const finalAmountCharged = tentative.amountCharged || 0;

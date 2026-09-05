@@ -133,8 +133,37 @@ async function runTests() {
   console.log("Booking Success:", bookData.success);
   console.log("Booking ID (Tentative):", bookData.booking?.id);
   const tentativeBookingId = bookData.booking?.id;
+  if (!bookData.success || !tentativeBookingId) {
+    throw new Error(`Tentative booking creation failed: ${bookData.error}`);
+  }
 
-  // 7. Query availability after booking (tentative occupies the slot and its lock is deleted)
+  // Tentative intake currently accepts overlapping requests without capacity or lock checks.
+  const duplicateRes = await app.request('/api/bookings/tentative', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${adminToken}`
+    },
+    body: JSON.stringify({
+      phoneNumber: '9988776656',
+      setupConfigurationId,
+      count: 2,
+      date: testDate,
+      startTime: slotStartTime,
+      noOfHours: 1,
+      gameIds: [1]
+    })
+  });
+  const duplicateData = await duplicateRes.json();
+  if (!duplicateData.success || !duplicateData.booking?.id) {
+    throw new Error(`Overlapping tentative booking was rejected: ${duplicateData.error}`);
+  }
+  await app.request(`/api/bookings/tentative/${duplicateData.booking.id}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${adminToken}` }
+  });
+
+  // 7. Query availability after tentative intake
   console.log("\n7. Querying availability after booking completed...");
   const finalCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupConfigurationId=${setupConfigurationId}`);
   const finalCheck = await finalCheckRes.json();
