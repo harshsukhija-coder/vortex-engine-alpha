@@ -1,8 +1,6 @@
 import 'dotenv/config';
 import { app } from '../../index.js';
-import { db } from './index.js';
-import { slotLocksTable } from './schema.js';
-import { eq } from 'drizzle-orm';
+import { pool } from './index.js';
 
 async function runTests() {
   console.log("--- STARTING PUBLIC SLOT AVAILABILITY & LOCKING TESTS ---");
@@ -19,16 +17,25 @@ async function runTests() {
   const myLockToken = 'client-token-xyz-123';
   const otherLockToken = 'client-token-abc-789';
   
-  // Get active setups to run tests against a valid setupId/setupInstanceId dynamically
+  // Customer flow sees configurations only.
   const setupsRes = await app.request('/api/setups');
   const setupsData = await setupsRes.json();
-  const targetSetup = setupsData.setups?.[0];
-  if (!targetSetup || !targetSetup.instances || targetSetup.instances.length === 0) {
-    throw new Error("No setups or instances found to run integration tests!");
+  const targetSetup = setupsData.setupConfigurations?.[0];
+  if (!targetSetup) {
+    throw new Error("No setup configurations found to run integration tests!");
   }
-  const setupId = targetSetup.id;
-  const setupInstanceId = targetSetup.instances[0].id;
-  const instanceName = targetSetup.instances[0].name;
+  const setupConfigurationId = targetSetup.setupConfigurationId;
+
+  // Admin fetches physical instances only when assigning the confirmed booking.
+  const instancesRes = await app.request(`/api/setup-configurations/${setupConfigurationId}/instances`, {
+    headers: { 'Authorization': `Bearer ${adminToken}` }
+  });
+  const instancesData = await instancesRes.json();
+  const targetInstance = instancesData.instances?.[0];
+  if (!targetInstance) {
+    throw new Error("No active setup instances found to run integration tests!");
+  }
+  const setupInstanceId = targetInstance.id;
 
   // Use a randomized future date in test execution to avoid database record collisions
   const randMonth = Math.floor(9 + Math.random() * 3).toString().padStart(2, '0');
@@ -36,8 +43,8 @@ async function runTests() {
   const testDate = `2026-${randMonth}-${randDay}`;
 
   // 1. Fetch available slots for Setup (No Bookings/Locks yet)
-  console.log(`\n1. Querying available slots for date ${testDate} on Setup ID ${setupId} (Instance: ${instanceName})...`);
-  const slots1Res = await app.request(`/api/slots/available?date=${testDate}&setupId=${setupId}`);
+  console.log(`\n1. Querying available slots for date ${testDate} on configuration ${setupConfigurationId}...`);
+  const slots1Res = await app.request(`/api/slots/available?date=${testDate}&setupConfigurationId=${setupConfigurationId}`);
   const slots1 = await slots1Res.json();
   console.log("Status:", slots1Res.status);
   console.log("Booked intervals (Expected 0):", slots1.bookedIntervals?.length);
@@ -55,7 +62,7 @@ async function runTests() {
       'Authorization': `Bearer ${adminToken}`
     },
     body: JSON.stringify({
-      setupInstanceId: setupInstanceId,
+      setupConfigurationId,
       lockToken: myLockToken,
       date: testDate,
       startTime: slotStartTime,
@@ -68,14 +75,14 @@ async function runTests() {
 
   // 3. Query availability passing myLockToken (Should show 0 locked intervals for YOU because you pass your token)
   console.log("\n3. Querying availability with myLockToken (Should filter out own lock)...");
-  const myCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupInstanceId=${setupInstanceId}&lockToken=${myLockToken}`);
+  const myCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupConfigurationId=${setupConfigurationId}&lockToken=${myLockToken}`);
   const myCheck = await myCheckRes.json();
   console.log("Status:", myCheckRes.status);
   console.log("Locked intervals (Expected 0):", myCheck.lockedIntervals?.length);
 
   // 4. Query availability as guest / someone else (Should show 1 locked interval)
   console.log("\n4. Querying availability as guest (without token, should show 1 locked interval)...");
-  const guestCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupInstanceId=${setupInstanceId}`);
+  const guestCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupConfigurationId=${setupConfigurationId}`);
   const guestCheck = await guestCheckRes.json();
   console.log("Status:", guestCheckRes.status);
   console.log("Locked intervals (Expected 1):", guestCheck.lockedIntervals?.length);
@@ -92,7 +99,7 @@ async function runTests() {
       'Authorization': `Bearer ${adminToken}`
     },
     body: JSON.stringify({
-      setupInstanceId: setupInstanceId,
+      setupConfigurationId,
       lockToken: otherLockToken,
       date: testDate,
       startTime: slotStartTime,
@@ -103,8 +110,8 @@ async function runTests() {
   console.log("Status (Expected 400):", lockFailRes.status);
   console.log("Failure Error Message:", lockFailData.error);
 
-  // 6. Finalize Booking anonymously (Should pass without checking locks)
-  console.log("\n6. Finalizing Booking with phoneNumber...");
+  // 6. Convert the owned lock into a tentative booking
+  console.log("\n6. Creating tentative booking from owned lock...");
   const bookRes = await app.request('/api/bookings/tentative', {
     method: 'POST',
     headers: {
@@ -113,7 +120,7 @@ async function runTests() {
     },
     body: JSON.stringify({
       phoneNumber: '9988776655',
-      setupInstanceId: setupInstanceId,
+      setupConfigurationId,
       count: 2, // 2 people (applies BOGO!)
       date: testDate,
       startTime: slotStartTime,
@@ -127,16 +134,13 @@ async function runTests() {
   console.log("Booking ID (Tentative):", bookData.booking?.id);
   const tentativeBookingId = bookData.booking?.id;
 
-  // Clear locks manually in test since bookings API no longer checks/clears locks
-  await db.delete(slotLocksTable).where(eq(slotLocksTable.lockToken, myLockToken));
-
-  // 7. Query availability after booking (Should show BOOKED, locks deleted)
+  // 7. Query availability after booking (tentative occupies the slot and its lock is deleted)
   console.log("\n7. Querying availability after booking completed...");
-  const finalCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupInstanceId=${setupInstanceId}`);
+  const finalCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupConfigurationId=${setupConfigurationId}`);
   const finalCheck = await finalCheckRes.json();
-  console.log("Booked intervals (Expected 1):", finalCheck.bookedIntervals?.length);
-  if (finalCheck.bookedIntervals?.length > 0) {
-    console.log("Booked interval details:", finalCheck.bookedIntervals[0].startTimeFormatted, "to", finalCheck.bookedIntervals[0].endTimeFormatted, "status:", finalCheck.bookedIntervals[0].status);
+  console.log("Tentative intervals (Expected 1):", finalCheck.tentativeIntervals?.length);
+  if (finalCheck.tentativeIntervals?.length > 0) {
+    console.log("Tentative interval details:", finalCheck.tentativeIntervals[0].startTimeFormatted, "to", finalCheck.tentativeIntervals[0].endTimeFormatted, "status:", finalCheck.tentativeIntervals[0].status);
   }
 
   // 8. Admin confirms booking
@@ -146,7 +150,8 @@ async function runTests() {
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${adminToken}`
-    }
+    },
+    body: JSON.stringify({ setupInstanceId })
   });
   const confirmData = await confirmRes.json();
   console.log("Confirm Status (Expected 200):", confirmRes.status);
@@ -155,7 +160,9 @@ async function runTests() {
 
   // 8b. Query Occupancy API
   console.log("\n8b. Querying Occupancy API...");
-  const occRes = await app.request('/api/setup-instances/occupancy');
+  const occRes = await app.request('/api/setup-instances/occupancy', {
+    headers: { 'Authorization': `Bearer ${adminToken}` }
+  });
   const occData = await occRes.json();
   console.log("Occupancy status:", occRes.status);
   const matchedOcc = occData.occupancy?.find((o: any) => o.instanceId === setupInstanceId);
@@ -195,11 +202,13 @@ async function runTests() {
 
   // 10. Check availability again (slots should be AVAILABLE again!)
   console.log("\n10. Querying availability after cancellation (slots should be AVAILABLE)...");
-  const postCancelCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupInstanceId=${setupInstanceId}`);
+  const postCancelCheckRes = await app.request(`/api/slots/available?date=${testDate}&setupConfigurationId=${setupConfigurationId}`);
   const postCancelCheck = await postCancelCheckRes.json();
   console.log("Booked intervals (Expected 0):", postCancelCheck.bookedIntervals?.length);
 
   console.log("\n--- ALL PUBLIC SLOT AVAILABILITY & LOCKING TESTS PASSED PERFECTLY ---");
 }
 
-runTests().catch(console.error);
+runTests()
+  .catch(console.error)
+  .finally(() => pool.end());

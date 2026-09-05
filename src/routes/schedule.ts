@@ -9,7 +9,7 @@ import {
   slotLocksTable,
   tentativeBookingTable
 } from '../core/db/schema.js';
-import { formatSlot, getOperatingSlots, type OccupiedInterval } from '../core/schedule.js';
+import { getOperatingSlots } from '../core/schedule.js';
 import { addDaysIst, formatIstTime, parseTimeToDate, todayIst } from '../core/time.js';
 
 const schedule = new Hono();
@@ -17,14 +17,26 @@ const schedule = new Hono();
 const querySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   days: z.coerce.number().int().min(1).max(30).optional().default(14),
-  setupInstanceId: z.coerce.number().int().positive().optional(),
+  setupConfigurationId: z.coerce.number().int().positive().optional(),
   view: z.enum(['upcoming', 'grid']).optional().default('upcoming')
 });
 
-async function loadOccupied(instanceIds: number[], rangeStart: Date, rangeEnd: Date): Promise<OccupiedInterval[]> {
+interface ConfigurationInterval {
+  startTime: Date;
+  endTime: Date;
+  setupConfigurationId: number;
+  status: 'BOOKED' | 'TENTATIVE' | 'LOCKED';
+}
+
+async function loadOccupied(
+  setups: Array<{ id: number; setupConfigurationId: number }>,
+  rangeStart: Date,
+  rangeEnd: Date
+): Promise<ConfigurationInterval[]> {
+  const instanceIds = setups.map((setup) => setup.id);
+  const configurationIds = [...new Set(setups.map((setup) => setup.setupConfigurationId))];
   const [booked, tentative, locks] = await Promise.all([
     db.select({
-      id: bookingTable.id,
       startTime: bookingTable.startTime,
       endTime: bookingTable.endTime,
       setupId: bookingTable.setupId
@@ -35,12 +47,11 @@ async function loadOccupied(instanceIds: number[], rangeStart: Date, rangeEnd: D
       eq(bookingTable.status, 'CONFIRMED')
     )),
     db.select({
-      id: tentativeBookingTable.id,
       startTime: tentativeBookingTable.startTime,
       endTime: tentativeBookingTable.endTime,
-      setupId: tentativeBookingTable.setupId
+      setupConfigurationId: tentativeBookingTable.setupConfigurationId
     }).from(tentativeBookingTable).where(and(
-      inArray(tentativeBookingTable.setupId, instanceIds),
+      inArray(tentativeBookingTable.setupConfigurationId, configurationIds),
       lt(tentativeBookingTable.startTime, rangeEnd),
       gt(tentativeBookingTable.endTime, rangeStart)
     )),
@@ -61,23 +72,20 @@ async function loadOccupied(instanceIds: number[], rangeStart: Date, rangeEnd: D
     ...booked.map((b) => ({
       startTime: b.startTime,
       endTime: b.endTime,
-      setupInstanceId: b.setupId,
-      status: 'BOOKED' as const,
-      bookingId: b.id
+      setupConfigurationId: setups.find((setup) => setup.id === b.setupId)!.setupConfigurationId,
+      status: 'BOOKED' as const
     })),
-    ...tentative.map((t) => ({
-      startTime: t.startTime,
-      endTime: t.endTime,
-      setupInstanceId: t.setupId,
-      status: 'TENTATIVE' as const,
-      bookingId: t.id
+    ...tentative.map((booking) => ({
+      startTime: booking.startTime,
+      endTime: booking.endTime,
+      setupConfigurationId: booking.setupConfigurationId,
+      status: 'TENTATIVE' as const
     })),
     ...locks.map((l) => ({
       startTime: l.startTime,
       endTime: l.endTime,
-      setupInstanceId: l.setupId,
-      status: 'LOCKED' as const,
-      lockedUntil: l.lockedUntil
+      setupConfigurationId: setups.find((setup) => setup.id === l.setupId)!.setupConfigurationId,
+      status: 'LOCKED' as const
     }))
   ];
 }
@@ -95,13 +103,20 @@ schedule.get('/schedule', async (c) => {
     const windowEnd = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
     if (parsed.data.view === 'upcoming') {
+      const setups = await db.select().from(setupsTable);
       const filters = [
         eq(bookingTable.status, 'CONFIRMED'),
         gt(bookingTable.startTime, now),
         lt(bookingTable.startTime, windowEnd)
       ];
-      if (parsed.data.setupInstanceId) {
-        filters.push(eq(bookingTable.setupId, parsed.data.setupInstanceId));
+      if (parsed.data.setupConfigurationId) {
+        const instanceIds = setups
+          .filter((setup) => setup.setupConfigurationId === parsed.data.setupConfigurationId)
+          .map((setup) => setup.id);
+        if (instanceIds.length === 0) {
+          return c.json({ success: false, error: 'Setup configuration not found' }, 404);
+        }
+        filters.push(inArray(bookingTable.setupId, instanceIds));
       }
 
       const bookings = await db
@@ -110,14 +125,15 @@ schedule.get('/schedule', async (c) => {
         .where(and(...filters))
         .orderBy(asc(bookingTable.startTime));
 
-      const setups = await db.select().from(setupsTable);
+      const configs = await db.select().from(setupConfigurationsTable);
       const upcoming = bookings.map((b) => {
         const setup = setups.find((s) => s.id === b.setupId);
+        const config = configs.find((item) => item.id === setup?.setupConfigurationId);
         return {
           bookingId: b.id,
           status: b.status,
-          setupInstanceId: b.setupId,
-          setupName: setup?.name ?? null,
+          setupConfigurationId: config?.id ?? null,
+          setupName: config?.name ?? null,
           phoneNumber: b.phoneNumber,
           playersCount: b.count,
           date: b.startTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
@@ -145,19 +161,30 @@ schedule.get('/schedule', async (c) => {
     const endDate = addDaysIst(startDate, days - 1);
     const rangeEnd = new Date(parseTimeToDate(endDate, '11:59 PM').getTime() + 60 * 1000);
 
-    let setups = await db.select().from(setupsTable).where(eq(setupsTable.isActive, true));
-    if (parsed.data.setupInstanceId) {
-      setups = setups.filter((s) => s.id === parsed.data.setupInstanceId);
-      if (setups.length === 0) {
-        return c.json({ success: false, error: 'Setup instance not found' }, 404);
+    let configs = await db
+      .select()
+      .from(setupConfigurationsTable)
+      .where(eq(setupConfigurationsTable.isActive, true));
+    if (parsed.data.setupConfigurationId) {
+      configs = configs.filter((config) => config.id === parsed.data.setupConfigurationId);
+      if (configs.length === 0) {
+        return c.json({ success: false, error: 'Setup configuration not found' }, 404);
       }
     }
 
-    const instanceIds = setups.map((s) => s.id);
-    const occupied = instanceIds.length > 0
-      ? await loadOccupied(instanceIds, rangeStart, rangeEnd)
+    const configurationIds = configs.map((config) => config.id);
+    const setups = await db
+      .select()
+      .from(setupsTable)
+      .where(
+        and(
+          inArray(setupsTable.setupConfigurationId, configurationIds),
+          eq(setupsTable.isActive, true)
+        )
+      );
+    const occupied = setups.length > 0
+      ? await loadOccupied(setups, rangeStart, rangeEnd)
       : [];
-    const configs = await db.select().from(setupConfigurationsTable);
     const dateList = Array.from({ length: days }, (_, i) => addDaysIst(startDate, i));
 
     return c.json({
@@ -167,14 +194,41 @@ schedule.get('/schedule', async (c) => {
       operatingHours: { start: '08:00 AM', end: '12:00 AM', slotMinutes: 60 },
       days: dateList.map((date) => ({
         date,
-        setups: setups.map((setup) => {
-          const config = configs.find((cfg) => cfg.id === setup.setupConfigurationId);
-          const setupOccupied = occupied.filter((item) => item.setupInstanceId === setup.id);
+        setupConfigurations: configs.map((config) => {
+          const capacity = setups.filter(
+            (setup) => setup.setupConfigurationId === config.id
+          ).length;
           return {
-            instanceId: setup.id,
-            instanceName: setup.name,
-            consoleType: config?.consoleType ?? null,
-            slots: getOperatingSlots(date).map((slot) => formatSlot(slot.startTime, slot.endTime, setupOccupied, now))
+            setupConfigurationId: config.id,
+            name: config.name,
+            consoleType: config.consoleType,
+            capacity,
+            slots: getOperatingSlots(date).map((slot) => {
+              const hits = occupied.filter(
+                (item) =>
+                  item.setupConfigurationId === config.id &&
+                  item.startTime < slot.endTime &&
+                  item.endTime > slot.startTime
+              );
+              const availableInstances = Math.max(0, capacity - hits.length);
+              const status = slot.endTime <= now
+                ? 'PAST'
+                : availableInstances > 0
+                  ? 'AVAILABLE'
+                  : hits.some((item) => item.status === 'BOOKED')
+                    ? 'BOOKED'
+                    : hits.some((item) => item.status === 'TENTATIVE')
+                      ? 'TENTATIVE'
+                      : 'LOCKED';
+              return {
+                startTime: formatIstTime(slot.startTime),
+                endTime: formatIstTime(slot.endTime),
+                startTimeIso: slot.startTime.toISOString(),
+                endTimeIso: slot.endTime.toISOString(),
+                status,
+                availableInstances
+              };
+            })
           };
         })
       }))

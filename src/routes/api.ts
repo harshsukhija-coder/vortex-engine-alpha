@@ -16,13 +16,45 @@ import {
   customersTable,
   usersTable
 } from '../core/db/schema.js';
-import { eq, and, gte, lte, lt, gt, or, ilike, ne, inArray, desc, isNull } from 'drizzle-orm';
+import { eq, and, gte, lte, lt, gt, or, ilike, ne, inArray, desc, isNull, sql } from 'drizzle-orm';
 import * as z from 'zod';
 import { authMiddleware, requireRole } from '../middlewares/auth.js';
 import { verify } from 'hono/jwt';
 import env from '../core/env.js';
+import { evaluateOffers } from '../core/offers.js';
+import { calculatePriceForRule } from '../core/pricing.js';
 
 const api = new Hono();
+
+class BookingConflictError extends Error {}
+
+interface BookingInterval {
+  startTime: Date;
+  endTime: Date;
+}
+
+function hasConfigurationCapacity(
+  intervals: BookingInterval[],
+  requestedStart: Date,
+  requestedEnd: Date,
+  capacity: number
+) {
+  const events = [
+    ...intervals.flatMap((interval) => [
+      { at: Math.max(interval.startTime.getTime(), requestedStart.getTime()), delta: 1 },
+      { at: Math.min(interval.endTime.getTime(), requestedEnd.getTime()), delta: -1 }
+    ]),
+    { at: requestedStart.getTime(), delta: 1 },
+    { at: requestedEnd.getTime(), delta: -1 }
+  ].sort((a, b) => a.at - b.at || a.delta - b.delta);
+
+  let concurrent = 0;
+  for (const event of events) {
+    concurrent += event.delta;
+    if (concurrent > capacity) return false;
+  }
+  return true;
+}
 
 // Helper function to parse Date and Time String in Asia/Kolkata timezone to a UTC Date object
 function parseTimeToDate(dateStr: string, timeStr: string): Date {
@@ -53,6 +85,7 @@ function parseTimeToDate(dateStr: string, timeStr: string): Date {
 
 // Validation Schema for Booking creation (accepts full nested frontend payload or flat payload)
 const bookingSchema = z.object({
+  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID").optional(),
   setupInstanceId: z.number().int().positive("Invalid setup instance ID").optional(),
   setupId: z.number().int().positive().optional(),
   setupName: z.string().optional(),
@@ -110,25 +143,17 @@ const bookingSchema = z.object({
   upiAmount: z.number().nonnegative().optional()
 });
 
-// 1. GET /api/games - List all active available games (supports search via 'q' and filter via 'setupId')
+// 1. GET /api/games - List active games, optionally filtered by setup configuration
 api.get('/games', async (c) => {
   try {
     const query = c.req.query('q');
-    const setupIdParam = c.req.query('setupId') || c.req.query('setup_id');
+    const setupIdParam = c.req.query('setupConfigurationId') || c.req.query('setupId');
 
     let configId: number | null = null;
     if (setupIdParam) {
       const parsedId = parseInt(setupIdParam, 10);
       if (!isNaN(parsedId)) {
-        const [setup] = await db
-          .select()
-          .from(setupsTable)
-          .where(eq(setupsTable.id, parsedId));
-        if (setup) {
-          configId = setup.setupConfigurationId;
-        } else {
-          configId = parsedId;
-        }
+        configId = parsedId;
       }
     }
 
@@ -174,18 +199,13 @@ api.get('/games', async (c) => {
   }
 });
 
-// 2. GET /api/setups - List setups with their available games and instances
+// 2. GET /api/setups - List customer-selectable setup configurations
 api.get('/setups', async (c) => {
   try {
     const configs = await db
       .select()
       .from(setupConfigurationsTable)
       .where(eq(setupConfigurationsTable.isActive, true));
-
-    const setups = await db
-      .select()
-      .from(setupsTable)
-      .where(eq(setupsTable.isActive, true));
 
     const setupGames = await db
       .select({
@@ -207,35 +227,64 @@ api.get('/setups', async (c) => {
         .filter((sg) => sg.setupConfigurationId === config.id)
         .map((sg) => sg.game);
 
-      const instancesForConfig = setups
-        .filter((s) => s.setupConfigurationId === config.id);
-
       return {
-        id: config.id,
+        setupConfigurationId: config.id,
         name: config.name,
         description: config.description,
         consoleType: config.consoleType,
         screenType: config.screenType,
         price: config.price,
+        basePrice: config.price,
         singlePlayerPrice: config.singlePlayerPrice ?? config.price,
         multiplayerPrice: config.multiplayerPrice ?? config.price,
-        chargePerPersonPerHour: config.price,
+        pricingUnit: 'PER_PERSON_PER_HOUR',
         extendedConfigurations: config.extendedConfigurations,
         otherNecessaries: config.extendedConfigurations,
         isActive: config.isActive,
         createdAt: config.createdAt,
         updatedAt: config.updatedAt,
-        games: gamesForConfig,
-        instances: instancesForConfig
+        games: gamesForConfig
       };
     });
 
-    return c.json({ success: true, setups: result });
+    return c.json({ success: true, setupConfigurations: result });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);
   }
 });
+
+api.get(
+  '/setup-configurations/:id/instances',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  async (c) => {
+    const setupConfigurationId = Number(c.req.param('id'));
+    if (!Number.isInteger(setupConfigurationId) || setupConfigurationId <= 0) {
+      return c.json({ success: false, error: "Invalid setup configuration ID" }, 400);
+    }
+
+    const [configuration] = await db
+      .select()
+      .from(setupConfigurationsTable)
+      .where(eq(setupConfigurationsTable.id, setupConfigurationId));
+    if (!configuration) {
+      return c.json({ success: false, error: "Setup configuration not found" }, 404);
+    }
+
+    const instances = await db
+      .select()
+      .from(setupsTable)
+      .where(
+        and(
+          eq(setupsTable.setupConfigurationId, setupConfigurationId),
+          eq(setupsTable.isActive, true)
+        )
+      );
+
+    return c.json({ success: true, setupConfigurationId, instances });
+  }
+);
 
 // 3. GET /api/offers - List all active offers and details
 api.get('/offers', async (c) => {
@@ -266,7 +315,7 @@ api.get('/offers', async (c) => {
 
 // Validation schema for offer evaluation (accepts both nested frontend payload and flat payload)
 const evaluateOfferSchema = z.object({
-  setupInstanceId: z.number().int().positive("Invalid setup instance ID").optional(),
+  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID").optional(),
   setupId: z.number().int().positive().optional(),
   setupName: z.string().optional(),
   consoleType: z.string().optional(),
@@ -406,7 +455,10 @@ async function handleOffersEvaluation(c: any) {
     }
 
     const data = validated.data;
-    const setupInstanceId = data.setupInstanceId ?? data.setupId ?? 1;
+    const setupConfigurationId = data.setupConfigurationId ?? data.setupId;
+    if (!setupConfigurationId) {
+      return c.json({ success: false, error: "setupConfigurationId is required" }, 400);
+    }
     const bDetails = data.bookingDetails || {};
 
     const playersCount = bDetails.playersCount ?? bDetails.count ?? data.playersCount ?? data.count ?? (1 + (data.additionalMembers?.length || 0));
@@ -414,46 +466,40 @@ async function handleOffersEvaluation(c: any) {
     const startTimeStr = bDetails.startTime ?? data.startTime ?? "12:00 PM";
     const durationHours = bDetails.noOfHours ?? data.noOfHours ?? 1;
 
-    // Fetch setup instance and configuration details
-    let config: any = null;
-    let setupDb: any = null;
-
-    const [foundSetup] = await db.select().from(setupsTable).where(eq(setupsTable.id, setupInstanceId));
-    if (foundSetup) {
-      setupDb = foundSetup;
-      const [cfg] = await db.select().from(setupConfigurationsTable).where(
-        and(eq(setupConfigurationsTable.id, foundSetup.setupConfigurationId), eq(setupConfigurationsTable.isActive, true))
-      );
-      config = cfg;
-    } else {
-      const [cfg] = await db.select().from(setupConfigurationsTable).where(
-        and(eq(setupConfigurationsTable.id, setupInstanceId), eq(setupConfigurationsTable.isActive, true))
-      );
-      if (cfg) {
-        config = cfg;
-        setupDb = { id: setupInstanceId, name: cfg.name };
-      }
-    }
+    const [config] = await db.select().from(setupConfigurationsTable).where(
+      and(
+        eq(setupConfigurationsTable.id, setupConfigurationId),
+        eq(setupConfigurationsTable.isActive, true)
+      )
+    );
 
     if (!config) {
-      return c.json({ success: false, error: "Setup or configuration not found" }, 404);
+      return c.json({ success: false, error: "Setup configuration not found" }, 404);
     }
 
     const setup = {
-      id: setupDb.id,
-      name: setupDb.name,
+      id: config.id,
+      name: config.name,
       consoleType: config.consoleType,
       price: config.price,
       singlePlayerPrice: config.singlePlayerPrice ?? config.price,
       multiplayerPrice: config.multiplayerPrice ?? config.price
     };
 
-    const evaluation = evaluatePromotions({
-      setup,
-      playersCount,
-      dateStr,
-      startTimeStr,
-      durationHours
+    const pricing = calculatePriceForRule(config, playersCount, durationHours);
+    const [activeOffers, offerDetails] = await Promise.all([
+      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
+      db.select().from(offerDetailsTable)
+    ]);
+    const evaluation = evaluateOffers({
+      offers: activeOffers,
+      details: offerDetails,
+      originalAmount: pricing.basePrice,
+      players: playersCount,
+      durationHours,
+      ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+      gameIds: bDetails.gameIds ?? data.gameIds ?? [],
+      selectedOfferIds: data.appliedOfferIds
     });
 
     return c.json({
@@ -470,10 +516,15 @@ async function handleOffersEvaluation(c: any) {
         date: dateStr,
         startTime: startTimeStr,
         noOfHours: durationHours,
-        originalAmount: evaluation.originalAmount
+        ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+        calculationFormula: pricing.calculationFormula,
+        originalAmount: evaluation.originalAmount,
+        discountApplied: evaluation.discountApplied,
+        totalAmount: evaluation.totalAmount
       },
-      applicableOffers: evaluation.applicableOffers,
-      ineligibleOffers: evaluation.ineligibleOffers,
+      appliedOffers: evaluation.appliedOffers,
+      applicableOffers: evaluation.offers.filter((offer) => offer.eligible),
+      ineligibleOffers: evaluation.offers.filter((offer) => !offer.eligible),
       offers: evaluation.offers
     });
   } catch (error: any) {
@@ -500,7 +551,10 @@ api.post('/bookings/review', async (c) => {
     }
     const data = validated.data;
     const bDetails = data.bookingDetails || {};
-    const setupInstanceId = data.setupInstanceId ?? data.setupId ?? 1;
+    const setupConfigurationId = data.setupConfigurationId ?? data.setupId;
+    if (!setupConfigurationId) {
+      return c.json({ success: false, error: "setupConfigurationId is required" }, 400);
+    }
     const count = bDetails.playersCount ?? bDetails.count ?? data.playersCount ?? data.count ?? (1 + (data.additionalMembers?.length || 0));
     const date = bDetails.date ?? data.date ?? new Date().toISOString().slice(0, 10);
     const startTime = bDetails.startTime ?? data.startTime ?? "12:00 PM";
@@ -508,24 +562,16 @@ api.post('/bookings/review', async (c) => {
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
     const appliedOfferIds = data.appliedOfferIds;
 
-    // 1. Fetch setup instance and associated configuration details
-    const [setupDb] = await db.select().from(setupsTable).where(eq(setupsTable.id, setupInstanceId));
-    if (!setupDb) return c.json({ success: false, error: "Setup instance not found" }, 404);
-
     const [config] = await db.select().from(setupConfigurationsTable).where(
-      and(eq(setupConfigurationsTable.id, setupDb.setupConfigurationId), eq(setupConfigurationsTable.isActive, true))
+      and(
+        eq(setupConfigurationsTable.id, setupConfigurationId),
+        eq(setupConfigurationsTable.isActive, true)
+      )
     );
     if (!config) return c.json({ success: false, error: "Setup active configuration not found" }, 404);
 
     const pricing = calculatePriceForRule(config, count, noOfHours);
     const ratePerPersonPerHour = pricing.ratePerPersonPerHour;
-
-    const setup = {
-      ...setupDb,
-      consoleType: config.consoleType,
-      chargePerPersonPerHour: ratePerPersonPerHour,
-      otherNecessaries: config.extendedConfigurations
-    };
 
     // 2. Parse and format Date (e.g. Wednesday, 19 August 2026) in Asia/Kolkata
     const minStart = parseTimeToDate(date, startTime);
@@ -554,100 +600,25 @@ api.post('/bookings/review', async (c) => {
     }
 
     // 6. Calculate Price Calculations Text (same single vs multi rates as /price)
-    const priceCalculationText = count === 1
-      ? `₹${ratePerPersonPerHour} × 1 player × ${durationHours} hrs`
-      : `₹${ratePerPersonPerHour} × ${count} people × ${durationHours} hrs`;
+    const priceCalculationText = pricing.calculationFormula;
 
     // 7. Calculate Pricing & Offers
     const originalAmount = pricing.basePrice;
 
-    const activeOffers = await db.select().from(offerTable).where(eq(offerTable.isActive, true));
-    const offerDetails = await db.select().from(offerDetailsTable);
-
-    let amountCharged = originalAmount;
-    const appliedPromotions: Array<{ id: number; name: string; discount: number }> = [];
-    const availablePromotions: Array<{ id: number; name: string; reason: string }> = [];
-
-    for (const offer of activeOffers) {
-      const details = offerDetails.filter((d) => d.offerId === offer.id);
-      let eligible = true;
-      let ineligibleReason = "";
-
-      for (const d of details) {
-        if (d.condObj === 'amount') {
-          const thresh = d.condValue ? parseFloat(d.condValue) : 0;
-          if (d.cond === '>=' && originalAmount < thresh) {
-            eligible = false;
-            ineligibleReason = `Requires amount minimum ${thresh}`;
-          } else if (d.cond === '>' && originalAmount <= thresh) {
-            eligible = false;
-            ineligibleReason = `Requires amount greater than ${thresh}`;
-          }
-        } else if (d.condObj === 'person') {
-          const thresh = d.condValue ? parseInt(d.condValue, 10) : 0;
-          if (d.cond === '>=' && count < thresh) {
-            eligible = false;
-            ineligibleReason = `Requires at least ${thresh} players`;
-          } else if (d.cond === '>' && count <= thresh) {
-            eligible = false;
-            ineligibleReason = `Requires greater than ${thresh} players`;
-          }
-        } else if (d.condObj === 'game') {
-          const targetGameId = d.condValue ? parseInt(d.condValue, 10) : 0;
-          const hasGame = gameIds && gameIds.includes(targetGameId);
-          if (!hasGame) {
-            eligible = false;
-            ineligibleReason = `Requires booking game ID ${targetGameId}`;
-          }
-        }
-      }
-
-      if (eligible) {
-        let discount = 0;
-        for (const d of details) {
-          if (d.offerObj === 'amount') {
-            const valStr = d.offerValue || "0";
-            if (valStr.endsWith('%')) {
-              const pct = parseFloat(valStr.slice(0, -1)) / 100;
-              discount += Math.ceil(amountCharged * pct);
-            } else {
-              discount += parseFloat(valStr);
-            }
-          } else if (d.offerObj === 'person') {
-            const freeCount = Math.floor(count / 2);
-            const singlePersonShare = durationHours * setup.chargePerPersonPerHour;
-            discount += Math.ceil(freeCount * singlePersonShare);
-          }
-        }
-
-        const isSelected = !appliedOfferIds || appliedOfferIds.includes(offer.id);
-        if (discount > 0 && isSelected) {
-          amountCharged = Math.max(0, amountCharged - discount);
-          appliedPromotions.push({
-            id: offer.id,
-            name: offer.name,
-            discount: discount
-          });
-          if (offer.offerType === 'EXCLUSIVE') {
-            break;
-          }
-        } else if (discount > 0) {
-          availablePromotions.push({
-            id: offer.id,
-            name: offer.name,
-            reason: "Available"
-          });
-        }
-      } else {
-        availablePromotions.push({
-          id: offer.id,
-          name: offer.name,
-          reason: ineligibleReason
-        });
-      }
-    }
-
-    const discountApplied = originalAmount - amountCharged;
+    const [activeOffers, offerDetails] = await Promise.all([
+      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
+      db.select().from(offerDetailsTable)
+    ]);
+    const offerEvaluation = evaluateOffers({
+      offers: activeOffers,
+      details: offerDetails,
+      originalAmount,
+      players: count,
+      durationHours,
+      ratePerPersonPerHour,
+      gameIds,
+      selectedOfferIds: appliedOfferIds
+    });
 
     return c.json({
       success: true,
@@ -655,15 +626,17 @@ api.post('/bookings/review', async (c) => {
         date: dateFormatted,
         slotsFormatted,
         playersCount: count,
-        zoneName: setupDb.name,
+        zoneName: config.name,
         gamesList,
         durationHours,
         priceCalculationText,
         originalAmount,
-        discountApplied,
-        totalAmount: amountCharged,
-        appliedPromotions,
-        availablePromotions
+        discountApplied: offerEvaluation.discountApplied,
+        totalAmount: offerEvaluation.totalAmount,
+        appliedPromotions: offerEvaluation.appliedOffers,
+        availablePromotions: offerEvaluation.offers.filter(
+          (offer) => !offerEvaluation.appliedOffers.some((applied) => applied.id === offer.id)
+        )
       }
     });
   } catch (error: any) {
@@ -782,24 +755,42 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     const maxEnd = new Date(minStart.getTime() + noOfHours * 60 * 60 * 1000);
     const durationHours = noOfHours;
 
-    // Single vs Multi Player price rule
-    const isSingle = count === 1;
-    const singlePrice = config.singlePlayerPrice && config.singlePlayerPrice > 0 ? config.singlePlayerPrice : config.price;
-    const multiPrice = config.multiplayerPrice && config.multiplayerPrice > 0 ? config.multiplayerPrice : singlePrice;
-    const ratePerPersonPerHour = isSingle ? singlePrice : multiPrice;
-    const calcBasePrice = Math.ceil(durationHours * ratePerPersonPerHour * count);
-
-    const originalAmount = data.offers?.originalAmount ?? data.pricing?.basePrice ?? calcBasePrice;
-    let discountApplied = data.offers?.discountApplied ?? 0;
-    let amountCharged = data.offers?.totalAmount ?? (originalAmount - discountApplied);
-    const appliedOffers = data.offers?.appliedOffers ?? [];
+    const pricing = calculatePriceForRule(config, count, durationHours);
+    const ratePerPersonPerHour = pricing.ratePerPersonPerHour;
+    const originalAmount = pricing.basePrice;
+    const selectedOfferIds = data.appliedOfferIds
+      ?? data.offers?.appliedOfferIds
+      ?? data.offers?.appliedOffers?.flatMap((offer) => offer.id ? [offer.id] : []);
+    const [activeOffers, offerDetails] = await Promise.all([
+      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
+      db.select().from(offerDetailsTable)
+    ]);
+    const offerEvaluation = evaluateOffers({
+      offers: activeOffers,
+      details: offerDetails,
+      originalAmount,
+      players: count,
+      durationHours,
+      ratePerPersonPerHour,
+      gameIds,
+      selectedOfferIds
+    });
+    const discountApplied = offerEvaluation.discountApplied;
+    const amountCharged = offerEvaluation.totalAmount;
+    const appliedOffers = offerEvaluation.appliedOffers;
 
     // Payment amounts
     const cashAmount = data.cashAmount !== undefined ? data.cashAmount : (data.upiAmount !== undefined ? 0 : amountCharged);
     const upiAmount = data.upiAmount !== undefined ? data.upiAmount : 0;
-    const finalAmountCharged = (data.cashAmount !== undefined || data.upiAmount !== undefined)
-      ? (cashAmount + upiAmount)
-      : amountCharged;
+    if (
+      (data.cashAmount !== undefined || data.upiAmount !== undefined) &&
+      cashAmount + upiAmount !== amountCharged
+    ) {
+      return c.json({
+        success: false,
+        error: `Payment total must equal the booking amount of ₹${amountCharged}`
+      }, 400);
+    }
 
     // 4. Build setup snapshot — frozen config at time of booking
     const setupSnapshot = {
@@ -845,7 +836,7 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           bookedBy: adminId || null,
           count,
           originalAmount,
-          amountCharged: finalAmountCharged,
+          amountCharged,
           cashAmount,
           upiAmount,
           status: 'CONFIRMED',
@@ -862,7 +853,12 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
       if (lockToken) {
         await tx
           .delete(slotLocksTable)
-          .where(eq(slotLocksTable.lockToken, lockToken));
+          .where(
+            and(
+              eq(slotLocksTable.setupId, setupInstanceId),
+              eq(slotLocksTable.lockToken, lockToken)
+            )
+          );
       }
 
       // 5d. Record each individual slot in bookingSlotsTable
@@ -889,6 +885,12 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
               gameId: gameId
             });
         }
+      }
+
+      for (const offer of appliedOffers) {
+        await tx
+          .insert(bookingAndOffersTable)
+          .values({ bookingId: insertedBooking.id, offerId: offer.id });
       }
 
       return insertedBooking;
@@ -944,10 +946,11 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
         games: gamesList,
         pricing: {
           ratePerPersonPerHour,
-          playerType: isSingle ? 'SINGLE_PLAYER' : 'MULTIPLAYER',
+          playerType: pricing.playerType,
+          calculationFormula: pricing.calculationFormula,
           originalAmount,
           discountApplied,
-          totalAmount: finalAmountCharged,
+          totalAmount: amountCharged,
           cashAmount: booking.cashAmount,
           upiAmount: booking.upiAmount
         },
@@ -979,7 +982,10 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
     }
 
     const data = result.data;
-    const setupInstanceId = data.setupInstanceId ?? data.setupId ?? 1;
+    const setupConfigurationId = data.setupConfigurationId ?? data.setupId;
+    if (!setupConfigurationId) {
+      return c.json({ success: false, error: "setupConfigurationId is required" }, 400);
+    }
     const customer = data.customer || {};
     const phoneNumber = customer.phoneNumber ?? data.phoneNumber ?? "";
     if (!phoneNumber) {
@@ -987,133 +993,87 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
     }
     const bDetails = data.bookingDetails || {};
     const count = bDetails.playersCount ?? bDetails.count ?? data.count ?? (1 + (data.additionalMembers?.length || 0));
-    const date = bDetails.date ?? data.date ?? new Date().toISOString().slice(0, 10);
-    const startTime = bDetails.startTime ?? data.startTime ?? "12:00 PM";
-    const noOfHours = bDetails.noOfHours ?? data.noOfHours ?? 1;
+    const date = bDetails.date ?? data.date;
+    const startTime = bDetails.startTime ?? data.startTime;
+    const noOfHours = bDetails.noOfHours ?? data.noOfHours;
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return c.json({ success: false, error: "date is required in YYYY-MM-DD format" }, 400);
+    }
+    if (!startTime || !/^(0?[1-9]|1[0-2]):[0-5]\d\s*(AM|PM)$/i.test(startTime)) {
+      return c.json({ success: false, error: "startTime is required in hh:mm AM/PM format" }, 400);
+    }
+    if (!noOfHours) {
+      return c.json({ success: false, error: "noOfHours is required" }, 400);
+    }
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
     const userId = data.userId;
+    const lockToken = data.lockToken;
     const appliedOfferIds = data.appliedOfferIds ?? data.offers?.appliedOfferIds;
 
-    // 1. Fetch setup details (instance)
-    const [setupDb] = await db
-      .select()
-      .from(setupsTable)
-      .where(eq(setupsTable.id, setupInstanceId));
-
-    if (!setupDb) {
-      return c.json({ success: false, error: "Setup instance not found" }, 404);
-    }
-
-    if (!setupDb.isActive) {
-      return c.json({ success: false, error: "Setup instance is currently not active" }, 400);
-    }
-
+    // 1. Fetch the requested configuration. A physical instance is assigned only on confirmation.
     const [config] = await db
       .select()
       .from(setupConfigurationsTable)
       .where(
-        and(eq(setupConfigurationsTable.id, setupDb.setupConfigurationId), eq(setupConfigurationsTable.isActive, true))
+        and(
+          eq(setupConfigurationsTable.id, setupConfigurationId),
+          eq(setupConfigurationsTable.isActive, true)
+        )
       );
 
     if (!config) {
       return c.json({ success: false, error: "Setup configuration not found or is currently not active" }, 404);
     }
 
-    const setup = {
-      ...setupDb,
-      consoleType: config.consoleType,
-      chargePerPersonPerHour: config.price,
-      otherNecessaries: config.extendedConfigurations
-    };
+    const configurationInstances = await db
+      .select()
+      .from(setupsTable)
+      .where(
+        and(
+          eq(setupsTable.setupConfigurationId, setupConfigurationId),
+          eq(setupsTable.isActive, true)
+        )
+      );
+    if (configurationInstances.length === 0) {
+      return c.json({ success: false, error: "Setup configuration has no active instances" }, 409);
+    }
+
+    const pricing = calculatePriceForRule(config, count, noOfHours);
 
     const minStart = parseTimeToDate(date, startTime);
     const maxEnd = new Date(minStart.getTime() + noOfHours * 60 * 60 * 1000);
     const durationHours = noOfHours;
 
     // 2. Calculate Base Pricing
-    const originalAmount = Math.ceil(durationHours * setup.chargePerPersonPerHour * count);
+    const originalAmount = pricing.basePrice;
 
-    // 3. Fetch active offers and their details to find matching offers
-    const activeOffers = await db
-      .select()
-      .from(offerTable)
-      .where(eq(offerTable.isActive, true));
-
-    const offerDetails = await db
-      .select()
-      .from(offerDetailsTable);
-
-    let amountCharged = originalAmount;
-    const appliedOffers: Array<{ id: number; name: string; discount: number }> = [];
-
-    for (const offer of activeOffers) {
-      const details = offerDetails.filter((d) => d.offerId === offer.id);
-      if (details.length === 0) continue;
-
-      let isApplicable = true;
-
-      // Check all conditions for the offer
-      for (const d of details) {
-        if (d.condObj === 'amount') {
-          const thresh = d.condValue ? parseFloat(d.condValue) : 0;
-          if (d.cond === '>' && !(originalAmount > thresh)) isApplicable = false;
-          if (d.cond === '>=' && !(originalAmount >= thresh)) isApplicable = false;
-        } else if (d.condObj === 'person') {
-          const thresh = d.condValue ? parseInt(d.condValue, 10) : 0;
-          if (d.cond === '>=' && !(count >= thresh)) isApplicable = false;
-          if (d.cond === '>' && !(count > thresh)) isApplicable = false;
-        } else if (d.condObj === 'game') {
-          const targetGameId = d.condValue ? parseInt(d.condValue, 10) : 0;
-          const hasGame = gameIds && gameIds.includes(targetGameId);
-          if (!hasGame) isApplicable = false;
-        }
-      }
-
-      if (isApplicable) {
-        let discountAmount = 0;
-
-        // Apply discount based on offer value
-        for (const d of details) {
-          if (d.offerObj === 'amount') {
-            const valStr = d.offerValue || "0";
-            if (valStr.endsWith('%')) {
-              const pct = parseFloat(valStr.slice(0, -1)) / 100;
-              discountAmount += Math.ceil(amountCharged * pct);
-            } else {
-              discountAmount += parseFloat(valStr);
-            }
-          } else if (d.offerObj === 'person') {
-            const freeCount = Math.floor(count / 2);
-            const singlePersonShare = durationHours * setup.chargePerPersonPerHour;
-            discountAmount += Math.ceil(freeCount * singlePersonShare);
-          }
-        }
-
-        const isSelected = !appliedOfferIds || appliedOfferIds.includes(offer.id);
-        if (discountAmount > 0 && isSelected) {
-          amountCharged = Math.max(0, amountCharged - discountAmount);
-          appliedOffers.push({
-            id: offer.id,
-            name: offer.name,
-            discount: discountAmount
-          });
-          if (offer.offerType === 'EXCLUSIVE') {
-            break;
-          }
-        }
-      }
-    }
+    const [activeOffers, offerDetails] = await Promise.all([
+      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
+      db.select().from(offerDetailsTable)
+    ]);
+    const offerEvaluation = evaluateOffers({
+      offers: activeOffers,
+      details: offerDetails,
+      originalAmount,
+      players: count,
+      durationHours,
+      ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+      gameIds,
+      selectedOfferIds: appliedOfferIds
+    });
+    const amountCharged = offerEvaluation.totalAmount;
+    const appliedOffers = offerEvaluation.appliedOffers;
 
     // 4. Build setup snapshot
     const setupSnapshot = {
-      setupId: setup.id,
       setupConfigurationId: config.id,
-      instanceName: setup.name,
       name: config.name,
       description: config.description ?? null,
       consoleType: config.consoleType,
       price: config.price,
-      chargePerPersonPerHour: config.price,
+      singlePlayerPrice: config.singlePlayerPrice ?? config.price,
+      multiplayerPrice: config.multiplayerPrice ?? config.price,
+      chargePerPersonPerHour: pricing.ratePerPersonPerHour,
       extendedConfigurations: config.extendedConfigurations ?? null,
       otherNecessaries: config.extendedConfigurations ?? null,
       snapshotAt: new Date().toISOString()
@@ -1121,24 +1081,87 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
 
     // 5. Use database transaction to check overlap and insert tentative booking
     const tentativeBooking = await db.transaction(async (tx) => {
-      // 5a. Check existing booking overlap (confirmed)
-      const [existingBooking] = await tx
-        .select()
+      await tx.execute(sql`select pg_advisory_xact_lock(${setupConfigurationId})`);
+
+      const instanceIds = configurationInstances.map((instance) => instance.id);
+      const confirmedIntervals = await tx
+        .select({
+          startTime: bookingTable.startTime,
+          endTime: bookingTable.endTime
+        })
         .from(bookingTable)
         .where(
           and(
-            eq(bookingTable.setupId, setupInstanceId),
+            inArray(bookingTable.setupId, instanceIds),
             lt(bookingTable.startTime, maxEnd),
             gt(bookingTable.endTime, minStart),
             ne(bookingTable.status, 'CANCELLED')
           )
         );
-      // 5b. Create the tentative booking entry
+
+      const tentativeIntervals = await tx
+        .select({
+          startTime: tentativeBookingTable.startTime,
+          endTime: tentativeBookingTable.endTime
+        })
+        .from(tentativeBookingTable)
+        .where(
+          and(
+            eq(tentativeBookingTable.setupConfigurationId, setupConfigurationId),
+            lt(tentativeBookingTable.startTime, maxEnd),
+            gt(tentativeBookingTable.endTime, minStart)
+          )
+        );
+
+      const activeLocks = await tx
+        .select({
+          id: slotLocksTable.id,
+          userId: slotLocksTable.userId,
+          lockToken: slotLocksTable.lockToken,
+          startTime: slotLocksTable.startTime,
+          endTime: slotLocksTable.endTime
+        })
+        .from(slotLocksTable)
+        .where(
+          and(
+            inArray(slotLocksTable.setupId, instanceIds),
+            lt(slotLocksTable.startTime, maxEnd),
+            gt(slotLocksTable.endTime, minStart),
+            gt(slotLocksTable.lockedUntil, new Date())
+          )
+        );
+
+      const ownedLocks = activeLocks.filter((activeLock) => {
+        const belongsToCheckout = lockToken
+          ? activeLock.lockToken === lockToken
+          : adminId !== undefined && activeLock.userId === adminId;
+        return (
+          belongsToCheckout &&
+          activeLock.startTime <= minStart &&
+          activeLock.endTime >= maxEnd
+        );
+      });
+      if (lockToken && ownedLocks.length === 0) {
+        throw new BookingConflictError("The slot lock is missing, expired, or does not cover the requested interval.");
+      }
+      const ownedLockIds = new Set(ownedLocks.map((ownedLock) => ownedLock.id));
+      const lockIntervals = activeLocks.filter((activeLock) => !ownedLockIds.has(activeLock.id));
+
+      const hasCapacity = hasConfigurationCapacity(
+        [...confirmedIntervals, ...tentativeIntervals, ...lockIntervals],
+        minStart,
+        maxEnd,
+        configurationInstances.length
+      );
+      if (!hasCapacity) {
+        throw new BookingConflictError("No setup instance is available for this configuration and interval.");
+      }
+
       const [insertedTentative] = await tx
         .insert(tentativeBookingTable)
         .values({
           phoneNumber,
-          setupId: setupInstanceId,
+          setupConfigurationId,
           userId: userId || adminId || null,
           bookedBy: adminId || null,
           count,
@@ -1154,6 +1177,12 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
         })
         .returning();
 
+      if (ownedLocks.length > 0) {
+        await tx
+          .delete(slotLocksTable)
+          .where(inArray(slotLocksTable.id, [...ownedLockIds]));
+      }
+
       return insertedTentative;
     });
 
@@ -1163,11 +1192,22 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
         ...tentativeBooking,
         appliedOffers,
         gamesBooked: gameIds || [],
-        setupSnapshot
+        setupSnapshot,
+        pricing: {
+          ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+          playerType: pricing.playerType,
+          calculationFormula: pricing.calculationFormula,
+          originalAmount,
+          discountApplied: offerEvaluation.discountApplied,
+          totalAmount: amountCharged
+        }
       }
     });
   } catch (error: any) {
     console.error(error);
+    if (error instanceof BookingConflictError) {
+      return c.json({ success: false, error: error.message }, 409);
+    }
     return c.json({ success: false, error: error.message }, 500);
   }
 });
@@ -1202,7 +1242,23 @@ api.get('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMI
         .orderBy(tentativeBookingTable.createdAt);
     }
 
-    return c.json({ success: true, bookings });
+    const configurationIds = [...new Set(bookings.map((booking) => booking.setupConfigurationId))];
+    const configurations = configurationIds.length > 0
+      ? await db
+        .select()
+        .from(setupConfigurationsTable)
+        .where(inArray(setupConfigurationsTable.id, configurationIds))
+      : [];
+
+    return c.json({
+      success: true,
+      bookings: bookings.map((booking) => ({
+        ...booking,
+        setupConfiguration: configurations.find(
+          (configuration) => configuration.id === booking.setupConfigurationId
+        ) ?? null
+      }))
+    });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);
@@ -1211,7 +1267,7 @@ api.get('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMI
 
 // Validation Schema for confirming tentative bookings
 const confirmBookingSchema = z.object({
-  setupInstanceId: z.number().int().positive("Invalid setup instance ID").optional(),
+  setupInstanceId: z.number().int().positive("Invalid setup instance ID"),
   cashAmount: z.number().nonnegative().optional(),
   upiAmount: z.number().nonnegative().optional(),
   startTime: z.string().optional(),
@@ -1247,26 +1303,29 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
         throw new Error("Tentative booking not found");
       }
 
-      // Determine setup instance to assign (override with setupInstanceId if provided)
-      const assignedSetupId = setupInstanceId || tentative.setupId;
-      if (!assignedSetupId) {
-        throw new Error("No setup instance assigned to this booking");
-      }
+      await tx.execute(sql`select pg_advisory_xact_lock(${tentative.setupConfigurationId})`);
 
       // Fetch the assigned setup instance to verify
       const [setupDb] = await tx
         .select()
         .from(setupsTable)
-        .where(eq(setupsTable.id, assignedSetupId));
-      if (!setupDb) {
-        throw new Error("Assigned setup instance not found");
+        .where(eq(setupsTable.id, setupInstanceId));
+      if (!setupDb || !setupDb.isActive) {
+        throw new Error("Assigned setup instance was not found or is inactive");
+      }
+      if (setupDb.setupConfigurationId !== tentative.setupConfigurationId) {
+        throw new Error("Assigned setup instance does not belong to the tentative booking configuration");
       }
 
       // Determine the session timings
       const finalStartTime = startTime ? new Date(startTime) : new Date(tentative.startTime);
       const finalEndTime = endTime ? new Date(endTime) : new Date(tentative.endTime);
 
-      if (isNaN(finalStartTime.getTime()) || isNaN(finalEndTime.getTime())) {
+      if (
+        isNaN(finalStartTime.getTime()) ||
+        isNaN(finalEndTime.getTime()) ||
+        finalEndTime <= finalStartTime
+      ) {
         throw new Error("Invalid start or end time specified");
       }
 
@@ -1276,7 +1335,7 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
         .from(bookingTable)
         .where(
           and(
-            eq(bookingTable.setupId, assignedSetupId),
+            eq(bookingTable.setupId, setupInstanceId),
             lt(bookingTable.startTime, finalEndTime),
             gt(bookingTable.endTime, finalStartTime),
             ne(bookingTable.status, 'CANCELLED')
@@ -1287,44 +1346,61 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
         throw new Error("Cannot confirm: The requested slot overlaps with an existing confirmed booking.");
       }
 
-      // Calculate amount charged
-      // If payment details are provided, total amount charged is cashAmount + upiAmount.
-      // Otherwise, default to tentative.amountCharged.
-      let finalAmountCharged = tentative.amountCharged || 0;
-      if (body.cashAmount !== undefined || body.upiAmount !== undefined) {
-        finalAmountCharged = cashAmount + upiAmount;
+      const [overlappingLock] = await tx
+        .select()
+        .from(slotLocksTable)
+        .where(
+          and(
+            eq(slotLocksTable.setupId, setupInstanceId),
+            lt(slotLocksTable.startTime, finalEndTime),
+            gt(slotLocksTable.endTime, finalStartTime),
+            gt(slotLocksTable.lockedUntil, new Date())
+          )
+        );
+      if (overlappingLock) {
+        throw new Error("Cannot confirm: The requested setup instance is temporarily locked.");
       }
 
-      // Rebuild setup snapshot if setup instance was overridden
-      let setupSnapshot = tentative.setupSnapshot;
-      if (setupInstanceId && setupInstanceId !== tentative.setupId) {
-        const [config] = await tx
-          .select()
-          .from(setupConfigurationsTable)
-          .where(eq(setupConfigurationsTable.id, setupDb.setupConfigurationId));
-        if (config) {
-          setupSnapshot = {
-            setupId: setupDb.id,
-            setupConfigurationId: config.id,
-            instanceName: setupDb.name,
-            name: config.name,
-            description: config.description ?? null,
-            consoleType: config.consoleType,
-            price: config.price,
-            chargePerPersonPerHour: config.price,
-            extendedConfigurations: config.extendedConfigurations ?? null,
-            otherNecessaries: config.extendedConfigurations ?? null,
-            snapshotAt: new Date().toISOString()
-          };
-        }
+      const finalAmountCharged = tentative.amountCharged || 0;
+      if (
+        (body.cashAmount !== undefined || body.upiAmount !== undefined) &&
+        cashAmount + upiAmount !== finalAmountCharged
+      ) {
+        throw new Error(`Payment total must equal the booking amount of ₹${finalAmountCharged}`);
       }
+
+      const [config] = await tx
+        .select()
+        .from(setupConfigurationsTable)
+        .where(eq(setupConfigurationsTable.id, tentative.setupConfigurationId));
+      if (!config) {
+        throw new Error("Tentative booking setup configuration not found");
+      }
+      const tentativeSnapshot = (
+        tentative.setupSnapshot &&
+        typeof tentative.setupSnapshot === 'object' &&
+        !Array.isArray(tentative.setupSnapshot)
+      ) ? tentative.setupSnapshot : {};
+      const setupSnapshot = {
+        ...tentativeSnapshot,
+        setupId: setupDb.id,
+        setupConfigurationId: config.id,
+        instanceName: setupDb.name,
+        name: config.name,
+        description: config.description ?? null,
+        consoleType: config.consoleType,
+        price: config.price,
+        extendedConfigurations: config.extendedConfigurations ?? null,
+        otherNecessaries: config.extendedConfigurations ?? null,
+        snapshotAt: new Date().toISOString()
+      };
 
       // 3. Move tentative booking to main bookingTable (slot allotment)
       const [booking] = await tx
         .insert(bookingTable)
         .values({
           phoneNumber: tentative.phoneNumber,
-          setupId: assignedSetupId,
+          setupId: setupInstanceId,
           userId: tentative.userId || adminId || null,
           bookedBy: adminId || tentative.bookedBy || null,
           originalAmount: tentative.originalAmount,
@@ -1391,7 +1467,23 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
     return c.json({
       success: true,
       message: "Tentative booking successfully confirmed.",
-      booking: result
+      booking: {
+        ...result,
+        pricing: {
+          ratePerPersonPerHour: (
+            result.setupSnapshot &&
+            typeof result.setupSnapshot === 'object' &&
+            !Array.isArray(result.setupSnapshot) &&
+            'chargePerPersonPerHour' in result.setupSnapshot
+          ) ? result.setupSnapshot.chargePerPersonPerHour : null,
+          playerType: result.count === 1 ? 'SINGLE_PLAYER' : 'MULTIPLAYER',
+          originalAmount: result.originalAmount,
+          discountApplied: (result.originalAmount ?? 0) - (result.amountCharged ?? 0),
+          totalAmount: result.amountCharged,
+          cashAmount: result.cashAmount,
+          upiAmount: result.upiAmount
+        }
+      }
     });
   } catch (error: any) {
     console.error(error);
@@ -1663,40 +1755,43 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
     const newEndTime = new Date(currentEndTime.getTime() + extensionMinutes * 60 * 1000);
 
     // 2. Pricing & Offers Calculation for total extended session
-    const calcNewOriginalAmount = Math.ceil(totalDurationHours * ratePerPersonPerHour * count);
-    const dateStr = currentStartTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
-    const startTimeStr = currentStartTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
-
-    // Evaluate promotional offers for the extended duration
-    const promoEvaluation = evaluatePromotions({
-      setup: {
-        id: setupId,
-        name: snapshot.instanceName || snapshot.name || "Setup",
-        consoleType: snapshot.consoleType || "Console",
-        price: snapshot.price || 120,
-        singlePlayerPrice: singlePrice,
-        multiplayerPrice: multiPrice
-      },
-      playersCount: count,
-      dateStr,
-      startTimeStr,
-      durationHours: totalDurationHours
+    const newOriginalAmount = Math.ceil(totalDurationHours * ratePerPersonPerHour * count);
+    const [activeOffers, offerDetails, bookedGames, existingBookingOffers] = await Promise.all([
+      db.select().from(offerTable).where(eq(offerTable.isActive, true)),
+      db.select().from(offerDetailsTable),
+      db.select({ gameId: bookingAndGames.gameId }).from(bookingAndGames).where(eq(bookingAndGames.bookingId, id)),
+      db.select({ offerId: bookingAndOffersTable.offerId }).from(bookingAndOffersTable).where(eq(bookingAndOffersTable.bookingId, id))
+    ]);
+    const targetOfferIds = data.offers?.appliedOfferIds
+      ?? data.appliedOfferIds
+      ?? existingBookingOffers.map((offer) => offer.offerId);
+    const offerEvaluation = evaluateOffers({
+      offers: activeOffers,
+      details: offerDetails,
+      originalAmount: newOriginalAmount,
+      players: count,
+      durationHours: totalDurationHours,
+      ratePerPersonPerHour,
+      gameIds: bookedGames.map((game) => game.gameId),
+      selectedOfferIds: targetOfferIds.length > 0 ? targetOfferIds : undefined
     });
-
-    const targetOfferIds = data.offers?.appliedOfferIds ?? data.appliedOfferIds;
-    let appliedOffers = promoEvaluation.applicableOffers;
-    if (targetOfferIds && targetOfferIds.length > 0) {
-      appliedOffers = promoEvaluation.applicableOffers.filter(o => targetOfferIds.includes(o.id));
-    }
-
-    const discountApplied = appliedOffers.reduce((acc, curr) => acc + curr.discount, 0);
-    const newOriginalAmount = data.offers?.originalAmount ?? calcNewOriginalAmount;
-    const newTotalAmount = data.offers?.totalAmount ?? Math.max(0, newOriginalAmount - discountApplied);
+    const appliedOffers = offerEvaluation.appliedOffers;
+    const discountApplied = offerEvaluation.discountApplied;
+    const newTotalAmount = offerEvaluation.totalAmount;
     const previousTotalAmount = booking.amountCharged || 0;
     const additionalAmountToPay = Math.max(0, newTotalAmount - previousTotalAmount);
 
     const addedCash = data.cashAmount !== undefined ? data.cashAmount : (data.upiAmount !== undefined ? 0 : additionalAmountToPay);
     const addedUpi = data.upiAmount !== undefined ? data.upiAmount : 0;
+    if (
+      (data.cashAmount !== undefined || data.upiAmount !== undefined) &&
+      addedCash + addedUpi !== additionalAmountToPay
+    ) {
+      return c.json({
+        success: false,
+        error: `Extension payment must equal ₹${additionalAmountToPay}`
+      }, 400);
+    }
 
     // 3. Database transaction to check overlap and perform update
     const updated = await db.transaction(async (tx) => {
@@ -1749,6 +1844,15 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
         })
         .where(eq(bookingTable.id, id))
         .returning();
+
+      await tx
+        .delete(bookingAndOffersTable)
+        .where(eq(bookingAndOffersTable.bookingId, id));
+      for (const offer of appliedOffers) {
+        await tx
+          .insert(bookingAndOffersTable)
+          .values({ bookingId: id, offerId: offer.id });
+      }
 
       // 3d. Record newly added slot(s) in bookingSlotsTable
       const numSlotsToAdd = Math.ceil(extensionMinutes / 60);
@@ -1878,28 +1982,28 @@ async function handleEndSessionLogic(params: {
   // Recalculate original base amount for actual duration
   const finalOriginalAmount = Math.ceil(actualDurationHours * ratePerPersonPerHour * count);
 
-  // Evaluate promotional offers for actual session
-  const dateStr = actualStartTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-  const startTimeStr = actualStartTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
-
-  const promoEval = evaluatePromotions({
-    setup: {
-      id: booking.setupId,
-      name: snapshot.instanceName || snapshot.name || "Setup",
-      consoleType: snapshot.consoleType || "Console",
-      price: snapshot.price || 120,
-      singlePlayerPrice: singlePrice,
-      multiplayerPrice: multiPrice
-    },
-    playersCount: count,
-    dateStr,
-    startTimeStr,
-    durationHours: actualDurationHours
+  const [activeOffers, offerDetails, bookedGames, existingBookingOffers] = await Promise.all([
+    db.select().from(offerTable).where(eq(offerTable.isActive, true)),
+    db.select().from(offerDetailsTable),
+    db.select({ gameId: bookingAndGames.gameId }).from(bookingAndGames).where(eq(bookingAndGames.bookingId, booking.id)),
+    db.select({ offerId: bookingAndOffersTable.offerId }).from(bookingAndOffersTable).where(eq(bookingAndOffersTable.bookingId, booking.id))
+  ]);
+  const offerEvaluation = evaluateOffers({
+    offers: activeOffers,
+    details: offerDetails,
+    originalAmount: finalOriginalAmount,
+    players: count,
+    durationHours: actualDurationHours,
+    ratePerPersonPerHour,
+    gameIds: bookedGames.map((game) => game.gameId),
+    selectedOfferIds: existingBookingOffers.length > 0
+      ? existingBookingOffers.map((offer) => offer.offerId)
+      : undefined
   });
 
-  const appliedOffers = promoEval.applicableOffers;
-  const discountApplied = appliedOffers.reduce((acc, curr) => acc + curr.discount, 0);
-  const finalAmountCharged = Math.max(0, finalOriginalAmount - discountApplied);
+  const appliedOffers = offerEvaluation.appliedOffers;
+  const discountApplied = offerEvaluation.discountApplied;
+  const finalAmountCharged = offerEvaluation.totalAmount;
 
   const initialAmountPaid = (booking.cashAmount || 0) + (booking.upiAmount || 0) || (booking.amountCharged || 0);
   const balanceDiff = initialAmountPaid - finalAmountCharged;
@@ -2258,15 +2362,12 @@ function getSlotsForDate(dateStr: string) {
 
 const slotsQuerySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in format YYYY-MM-DD"),
-  setupId: z.string().transform((val) => parseInt(val, 10)).pipe(z.number().int().positive()).optional(),
-  setupInstanceId: z.string().transform((val) => parseInt(val, 10)).pipe(z.number().int().positive()).optional(),
+  setupConfigurationId: z.string().transform((val) => parseInt(val, 10)).pipe(z.number().int().positive()),
   lockToken: z.string().optional()
-}).refine(data => data.setupId !== undefined || data.setupInstanceId !== undefined, {
-  message: "Either setupId or setupInstanceId must be provided"
 });
 
 const lockIntervalSchema = z.object({
-  setupInstanceId: z.number().int().positive("Invalid setup instance ID"),
+  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID"),
   lockToken: z.string().min(1, "lockToken is required"),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in format YYYY-MM-DD"),
   startTime: z.string().min(1, "Start time is required"),
@@ -2281,24 +2382,31 @@ api.get('/slots/available', async (c) => {
     if (!validated.success) {
       return c.json({ success: false, error: "Invalid query parameters", details: validated.error.format() }, 400);
     }
-    const { date, setupId, setupInstanceId, lockToken } = validated.data;
+    const { date, setupConfigurationId, lockToken } = validated.data;
 
-    let targetInstanceIds: number[] = [];
-    if (setupInstanceId) {
-      const [setup] = await db.select().from(setupsTable).where(eq(setupsTable.id, setupInstanceId));
-      if (!setup) return c.json({ success: false, error: "Setup instance not found" }, 404);
-      targetInstanceIds = [setup.id];
-    } else if (setupId) {
-      const [config] = await db.select().from(setupConfigurationsTable).where(eq(setupConfigurationsTable.id, setupId));
-      if (!config) return c.json({ success: false, error: "Setup configuration not found" }, 404);
-      const instances = await db.select().from(setupsTable).where(
-        and(eq(setupsTable.setupConfigurationId, setupId), eq(setupsTable.isActive, true))
-      );
-      targetInstanceIds = instances.map(i => i.id);
-    }
+    const [config] = await db
+      .select()
+      .from(setupConfigurationsTable)
+      .where(eq(setupConfigurationsTable.id, setupConfigurationId));
+    if (!config) return c.json({ success: false, error: "Setup configuration not found" }, 404);
+
+    const instances = await db.select().from(setupsTable).where(
+      and(
+        eq(setupsTable.setupConfigurationId, setupConfigurationId),
+        eq(setupsTable.isActive, true)
+      )
+    );
+    const targetInstanceIds = instances.map((instance) => instance.id);
+    const targetConfigurationIds = [setupConfigurationId];
 
     if (targetInstanceIds.length === 0) {
-      return c.json({ success: true, date, bookedIntervals: [], lockedIntervals: [] });
+      return c.json({
+        success: true,
+        date,
+        bookedIntervals: [],
+        tentativeIntervals: [],
+        lockedIntervals: []
+      });
     }
 
     const dayStart = new Date(`${date}T00:00:00+05:30`);
@@ -2327,12 +2435,12 @@ api.get('/slots/available', async (c) => {
       .select({
         startTime: tentativeBookingTable.startTime,
         endTime: tentativeBookingTable.endTime,
-        setupInstanceId: tentativeBookingTable.setupId
+        setupConfigurationId: tentativeBookingTable.setupConfigurationId
       })
       .from(tentativeBookingTable)
       .where(
         and(
-          inArray(tentativeBookingTable.setupId, targetInstanceIds),
+          inArray(tentativeBookingTable.setupConfigurationId, targetConfigurationIds),
           lt(tentativeBookingTable.startTime, dayEnd),
           gt(tentativeBookingTable.endTime, dayStart)
         )
@@ -2356,29 +2464,25 @@ api.get('/slots/available', async (c) => {
         )
       );
 
-    const formattedBooked = [
-      ...bookedIntervals.map(b => ({
-        setupInstanceId: b.setupInstanceId,
+    const formattedBooked = bookedIntervals.map(b => ({
         startTime: b.startTime.toISOString(),
         endTime: b.endTime.toISOString(),
         status: b.status,
         startTimeFormatted: b.startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
         endTimeFormatted: b.endTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })
-      })),
-      ...tentativeIntervals.map(t => ({
-        setupInstanceId: t.setupInstanceId,
+      }));
+    const formattedTentative = tentativeIntervals.map(t => ({
+        setupConfigurationId: t.setupConfigurationId,
         startTime: t.startTime.toISOString(),
         endTime: t.endTime.toISOString(),
         status: 'TENTATIVE',
         startTimeFormatted: t.startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
         endTimeFormatted: t.endTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })
-      }))
-    ];
+      }));
 
     const formattedLocked = activeLocks
       .filter(l => !lockToken || l.lockToken !== lockToken)
       .map(l => ({
-        setupInstanceId: l.setupInstanceId,
         startTime: l.startTime.toISOString(),
         endTime: l.endTime.toISOString(),
         startTimeFormatted: l.startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' }),
@@ -2389,9 +2493,9 @@ api.get('/slots/available', async (c) => {
     return c.json({
       success: true,
       date,
-      setupId,
-      setupInstanceId,
+      setupConfigurationId,
       bookedIntervals: formattedBooked,
+      tentativeIntervals: formattedTentative,
       lockedIntervals: formattedLocked
     });
   } catch (error: any) {
@@ -2403,17 +2507,38 @@ api.get('/slots/available', async (c) => {
 // 5b. POST /api/slots/lock - Temporary lock an interval during checkout (Restricted to Admin/Super Admin)
 api.post('/slots/lock', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
   try {
+    const jwtPayload = c.get('jwtPayload') as { id?: number };
+    const userId = jwtPayload?.id;
     const body = await c.req.json();
     const validated = lockIntervalSchema.safeParse(body);
     if (!validated.success) {
       return c.json({ success: false, error: "Validation failed", details: validated.error.format() }, 400);
     }
-    const { setupInstanceId, lockToken, date, startTime, noOfHours } = validated.data;
+    const { setupConfigurationId, lockToken, date, startTime, noOfHours } = validated.data;
 
-    // Check if setup instance exists
-    const [instance] = await db.select().from(setupsTable).where(eq(setupsTable.id, setupInstanceId));
-    if (!instance) {
-      return c.json({ success: false, error: "Setup instance not found" }, 404);
+    const [configuration] = await db
+      .select()
+      .from(setupConfigurationsTable)
+      .where(
+        and(
+          eq(setupConfigurationsTable.id, setupConfigurationId),
+          eq(setupConfigurationsTable.isActive, true)
+        )
+      );
+    if (!configuration) {
+      return c.json({ success: false, error: "Setup configuration was not found or is inactive" }, 404);
+    }
+    const configurationInstances = await db
+      .select()
+      .from(setupsTable)
+      .where(
+        and(
+          eq(setupsTable.setupConfigurationId, setupConfigurationId),
+          eq(setupsTable.isActive, true)
+        )
+      );
+    if (configurationInstances.length === 0) {
+      return c.json({ success: false, error: "Setup configuration has no active instances" }, 409);
     }
 
     const requestedStart = parseTimeToDate(date, startTime);
@@ -2421,70 +2546,82 @@ api.post('/slots/lock', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), a
     const lockedUntil = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
     const result = await db.transaction(async (tx) => {
-      // 1. Check existing booking overlap (confirmed)
-      const [existingBooking] = await tx
-        .select()
+      await tx.execute(sql`select pg_advisory_xact_lock(${setupConfigurationId})`);
+
+      const configurationInstanceIds = configurationInstances.map((setup) => setup.id);
+      const confirmedIntervals = await tx
+        .select({
+          setupId: bookingTable.setupId,
+          startTime: bookingTable.startTime,
+          endTime: bookingTable.endTime
+        })
         .from(bookingTable)
         .where(
           and(
-            eq(bookingTable.setupId, setupInstanceId),
+            inArray(bookingTable.setupId, configurationInstanceIds),
             lt(bookingTable.startTime, requestedEnd),
             gt(bookingTable.endTime, requestedStart),
             ne(bookingTable.status, 'CANCELLED')
           )
         );
-      if (existingBooking) {
-        throw new Error(`The requested interval (${startTime} for ${noOfHours} hours) overlaps with an existing confirmed booking.`);
-      }
-
-      // 1b. Check existing tentative booking overlap
-      const [existingTentative] = await tx
-        .select()
+      const tentativeIntervals = await tx
+        .select({
+          startTime: tentativeBookingTable.startTime,
+          endTime: tentativeBookingTable.endTime
+        })
         .from(tentativeBookingTable)
         .where(
           and(
-            eq(tentativeBookingTable.setupId, setupInstanceId),
+            eq(tentativeBookingTable.setupConfigurationId, setupConfigurationId),
             lt(tentativeBookingTable.startTime, requestedEnd),
             gt(tentativeBookingTable.endTime, requestedStart)
           )
         );
-      if (existingTentative) {
-        throw new Error(`The requested interval overlaps with a tentative booking.`);
-      }
-
-      // 2. Check existing active lock overlap by another user/token
-      const [existingLock] = await tx
-        .select()
+      const lockIntervals = await tx
+        .select({
+          setupId: slotLocksTable.setupId,
+          startTime: slotLocksTable.startTime,
+          endTime: slotLocksTable.endTime
+        })
         .from(slotLocksTable)
         .where(
           and(
-            eq(slotLocksTable.setupId, setupInstanceId),
+            inArray(slotLocksTable.setupId, configurationInstanceIds),
             lt(slotLocksTable.startTime, requestedEnd),
             gt(slotLocksTable.endTime, requestedStart),
             gt(slotLocksTable.lockedUntil, new Date()),
             ne(slotLocksTable.lockToken, lockToken)
           )
         );
-
-      if (existingLock) {
-        throw new Error(`The requested interval overlaps with a temporary lock by another user.`);
+      if (!hasConfigurationCapacity(
+        [...confirmedIntervals, ...tentativeIntervals, ...lockIntervals],
+        requestedStart,
+        requestedEnd,
+        configurationInstances.length
+      )) {
+        throw new Error("No setup instance is available for this configuration and interval.");
       }
 
-      // Remove any old locks from same user token to prevent duplicate entries
       await tx
         .delete(slotLocksTable)
-        .where(
-          and(
-            eq(slotLocksTable.setupId, setupInstanceId),
-            eq(slotLocksTable.lockToken, lockToken)
-          )
-        );
+        .where(eq(slotLocksTable.lockToken, lockToken));
 
-      // Perform lock
+      const occupiedInstanceIds = new Set([
+        ...confirmedIntervals.map((interval) => interval.setupId),
+        ...lockIntervals.map((interval) => interval.setupId)
+      ]);
+      const selectedInstance = configurationInstances.find(
+        (instance) => !occupiedInstanceIds.has(instance.id)
+      );
+      if (!selectedInstance) {
+        throw new Error("No setup instance is available for this configuration and interval.");
+      }
+
       const [lockRecord] = await tx
         .insert(slotLocksTable)
         .values({
-          setupId: setupInstanceId,
+          setupId: selectedInstance.id,
+          userId: userId ?? null,
           lockToken,
           slotDate: date,
           startTime: requestedStart,
@@ -2496,7 +2633,18 @@ api.post('/slots/lock', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), a
       return lockRecord;
     });
 
-    return c.json({ success: true, message: "Interval successfully locked for 5 minutes", lock: result });
+    return c.json({
+      success: true,
+      message: "Configuration interval successfully locked for 5 minutes",
+      lock: {
+        id: result.id,
+        setupConfigurationId,
+        lockToken: result.lockToken,
+        startTime: result.startTime,
+        endTime: result.endTime,
+        lockedUntil: result.lockedUntil
+      }
+    });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 400);
@@ -2693,7 +2841,7 @@ api.post('/offers', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async
   }
 });
 
-api.get('/setup-instances/occupancy', async (c) => {
+api.get('/setup-instances/occupancy', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
   try {
     const setups = await db
       .select()
@@ -2759,13 +2907,14 @@ api.get('/setup-instances/occupancy', async (c) => {
           id: config.id,
           name: config.name,
           consoleType: config.consoleType,
-          chargePerPersonPerHour: config.price,
+          basePrice: config.price,
           singlePlayerPrice: (config.singlePlayerPrice && config.singlePlayerPrice > 0)
             ? config.singlePlayerPrice
             : config.price,
           multiplayerPrice: (config.multiplayerPrice && config.multiplayerPrice > 0)
             ? config.multiplayerPrice
-            : config.price
+            : config.price,
+          pricingUnit: 'PER_PERSON_PER_HOUR'
         } : null,
         status,
         currentBooking: activeBooking ? {
@@ -3032,29 +3181,6 @@ api.get('/customers/lookup', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN'
   }
 });
 
-// Helper function to calculate base price according to Single Player vs Multi Player pricing rule
-function calculatePriceForRule(
-  config: { price: number; singlePlayerPrice?: number | null; multiplayerPrice?: number | null },
-  players: number,
-  durationHours: number
-) {
-  const isSingle = players === 1;
-  const singleRate = (config.singlePlayerPrice && config.singlePlayerPrice > 0) ? config.singlePlayerPrice : config.price;
-  const multiRate = (config.multiplayerPrice && config.multiplayerPrice > 0) ? config.multiplayerPrice : singleRate;
-  const ratePerPersonPerHour = isSingle ? singleRate : multiRate;
-  const basePrice = Math.ceil(durationHours * ratePerPersonPerHour * players);
-  const calculationFormula = isSingle
-    ? `₹${ratePerPersonPerHour}/hr × 1 player × ${durationHours} hr(s) = ₹${basePrice}`
-    : `₹${ratePerPersonPerHour}/player/hr × ${players} players × ${durationHours} hr(s) = ₹${basePrice}`;
-
-  return {
-    basePrice,
-    ratePerPersonPerHour,
-    playerType: isSingle ? ('SINGLE_PLAYER' as const) : ('MULTIPLAYER' as const),
-    calculationFormula
-  };
-}
-
 // Helper function to parse session duration flexibly (handles numbers in hours/minutes, strings like "90m", "1.5h", etc.)
 function parseSessionDurationInput(rawDuration: any, rawHours?: any, rawMinutes?: any): number {
   if (rawHours !== undefined && rawHours !== null && rawHours !== '') {
@@ -3085,15 +3211,15 @@ function parseSessionDurationInput(rawDuration: any, rawHours?: any, rawMinutes?
 }
 
 // Price Calculation Handler logic
-async function handlePriceCalculation(c: any, input: { setupId?: any; noOfPlayers?: any; sessionDuration?: any; noOfHours?: any; durationMinutes?: any }) {
-  const setupIdRaw = input.setupId;
-  if (!setupIdRaw) {
-    return c.json({ success: false, error: 'setupId is required' }, 400);
+async function handlePriceCalculation(c: any, input: { setupConfigurationId?: any; noOfPlayers?: any; sessionDuration?: any; noOfHours?: any; durationMinutes?: any }) {
+  const setupConfigurationIdRaw = input.setupConfigurationId;
+  if (!setupConfigurationIdRaw) {
+    return c.json({ success: false, error: 'setupConfigurationId is required' }, 400);
   }
 
-  const setupId = parseInt(String(setupIdRaw), 10);
-  if (isNaN(setupId) || setupId <= 0) {
-    return c.json({ success: false, error: 'Invalid setupId' }, 400);
+  const setupConfigurationId = parseInt(String(setupConfigurationIdRaw), 10);
+  if (isNaN(setupConfigurationId) || setupConfigurationId <= 0) {
+    return c.json({ success: false, error: 'Invalid setupConfigurationId' }, 400);
   }
 
   const players = input.noOfPlayers !== undefined && input.noOfPlayers !== null && input.noOfPlayers !== ''
@@ -3102,36 +3228,13 @@ async function handlePriceCalculation(c: any, input: { setupId?: any; noOfPlayer
 
   const durationHours = parseSessionDurationInput(input.sessionDuration, input.noOfHours, input.durationMinutes);
 
-  // 1. Fetch setup instance first
-  let config: any = null;
-  let setupName = '';
-
-  const [setupDb] = await db
+  const [config] = await db
     .select()
-    .from(setupsTable)
-    .where(eq(setupsTable.id, setupId));
-
-  if (setupDb) {
-    setupName = setupDb.name;
-    const [cfg] = await db
-      .select()
-      .from(setupConfigurationsTable)
-      .where(eq(setupConfigurationsTable.id, setupDb.setupConfigurationId));
-    config = cfg;
-  } else {
-    // Check if setupId refers directly to setupConfigurationsTable
-    const [cfg] = await db
-      .select()
-      .from(setupConfigurationsTable)
-      .where(eq(setupConfigurationsTable.id, setupId));
-    if (cfg) {
-      config = cfg;
-      setupName = cfg.name;
-    }
-  }
+    .from(setupConfigurationsTable)
+    .where(eq(setupConfigurationsTable.id, setupConfigurationId));
 
   if (!config) {
-    return c.json({ success: false, error: 'Setup not found' }, 404);
+    return c.json({ success: false, error: 'Setup configuration not found' }, 404);
   }
 
   const result = calculatePriceForRule(config, players, durationHours);
@@ -3140,8 +3243,8 @@ async function handlePriceCalculation(c: any, input: { setupId?: any; noOfPlayer
     success: true,
     basePrice: result.basePrice,
     pricing: {
-      setupId,
-      setupName,
+      setupConfigurationId,
+      setupName: config.name,
       configurationName: config.name,
       playerType: result.playerType,
       noOfPlayers: players,
@@ -3157,13 +3260,13 @@ async function handlePriceCalculation(c: any, input: { setupId?: any; noOfPlayer
 api.post('/price', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
-    const setupId = body.setupId ?? body.setup_id ?? body.setupInstanceId ?? body.setupConfigurationId;
+    const setupConfigurationId = body.setupConfigurationId ?? body.setupId ?? body.setup_id;
     const noOfPlayers = body.noOfPlayers ?? body.no_of_players ?? body.players ?? body.count ?? body.noOfPersons;
     const sessionDuration = body.sessionDuration ?? body.session_duration ?? body.duration ?? body.noOfHours ?? body.durationHours;
     const noOfHours = body.noOfHours ?? body.durationHours;
     const durationMinutes = body.durationMinutes ?? body.session_duration_minutes;
 
-    return await handlePriceCalculation(c, { setupId, noOfPlayers, sessionDuration, noOfHours, durationMinutes });
+    return await handlePriceCalculation(c, { setupConfigurationId, noOfPlayers, sessionDuration, noOfHours, durationMinutes });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);
@@ -3173,13 +3276,13 @@ api.post('/price', async (c) => {
 // GET /api/price - Calculate base price via query parameters
 api.get('/price', async (c) => {
   try {
-    const setupId = c.req.query('setupId') || c.req.query('setup_id') || c.req.query('setupInstanceId') || c.req.query('setupConfigurationId');
+    const setupConfigurationId = c.req.query('setupConfigurationId') || c.req.query('setupId') || c.req.query('setup_id');
     const noOfPlayers = c.req.query('noOfPlayers') || c.req.query('no_of_players') || c.req.query('players') || c.req.query('count');
     const sessionDuration = c.req.query('sessionDuration') || c.req.query('session_duration') || c.req.query('duration') || c.req.query('noOfHours');
     const noOfHours = c.req.query('noOfHours') || c.req.query('durationHours');
     const durationMinutes = c.req.query('durationMinutes');
 
-    return await handlePriceCalculation(c, { setupId, noOfPlayers, sessionDuration, noOfHours, durationMinutes });
+    return await handlePriceCalculation(c, { setupConfigurationId, noOfPlayers, sessionDuration, noOfHours, durationMinutes });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);

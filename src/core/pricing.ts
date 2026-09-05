@@ -18,10 +18,12 @@ export function calculatePriceForRule(
     : singleRate;
   const ratePerPersonPerHour = isSingle ? singleRate : multiRate;
   const basePrice = Math.ceil(durationHours * ratePerPersonPerHour * players);
+  const calculationFormula = `₹${ratePerPersonPerHour} × ${players} player${players === 1 ? '' : 's'} × ${durationHours} hour${durationHours === 1 ? '' : 's'} = ₹${basePrice}`;
 
   return {
     basePrice,
     ratePerPersonPerHour,
-    playerType: isSingle ? ('SINGLE_PLAYER' as const) : ('MULTIPLAYER' as const)
+    playerType: isSingle ? ('SINGLE_PLAYER' as const) : ('MULTIPLAYER' as const),
+    calculationFormula
   };
 }

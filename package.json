@@ -2,16 +2,19 @@
   "name": "vortex-engine",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "DOTENV_CONFIG_PATH=.env.development tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "start:services": "docker compose up -d",
-    "stop:services": "docker compose down",
-    "db:schema:push": "npx drizzle-kit push",
-    "db:migration:generate": "npx drizzle-kit generate",
-    "db:migration:apply": "npx drizzle-kit migrate",
-    "db:seed": "tsx src/core/db/seed.ts",
-    "db:verify": "tsx src/core/db/verify.ts"
+    "start:services": "docker compose --env-file .env.development up -d --wait",
+    "stop:services": "docker compose --env-file .env.development down",
+    "db:schema:push": "DOTENV_CONFIG_PATH=.env.development drizzle-kit push",
+    "db:migration:generate": "DOTENV_CONFIG_PATH=.env.development drizzle-kit generate",
+    "db:migration:apply": "DOTENV_CONFIG_PATH=.env.development drizzle-kit migrate",
+    "db:seed": "DOTENV_CONFIG_PATH=.env.development tsx src/core/db/seed.ts",
+    "db:verify": "DOTENV_CONFIG_PATH=.env.development tsx src/core/db/verify.ts",
+    "test:pricing": "tsx src/core/pricing.test.ts",
+    "test:api": "DOTENV_CONFIG_PATH=.env.development tsx src/core/db/test-api.ts",
+    "setup:local": "pnpm start:services && pnpm db:migration:apply && pnpm db:seed && pnpm db:verify"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",

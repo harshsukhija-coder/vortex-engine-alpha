@@ -2,13 +2,23 @@ services:
   db:
     image: pgvector/pgvector:pg14
     container_name: vortex-db
-    restart: always
+    restart: unless-stopped
     env_file:
-      - .env
+      - .env.development
     ports:
-      - ${DB_PORT}:5432
+      - "${DB_PORT:-5430}:5432"
     environment:
       POSTGRES_USER: ${DB_USERNAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       PGDATA: /data/postgres
       POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - vortex-postgres-data:/data/postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_NAME}"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  vortex-postgres-data:

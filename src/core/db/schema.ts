@@ -166,7 +166,7 @@ export const bookingSlotsTable = pgTable("booking_slots", {
 export const tentativeBookingTable = pgTable('tentative_bookings', {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),
   phoneNumber: text("phone_number").notNull(),
-  setupId: integer("setup_id").references(() => setupsTable.id, { onDelete: "cascade" }),
+  setupConfigurationId: integer("setup_configuration_id").notNull().references(() => setupConfigurationsTable.id, { onDelete: "cascade" }),
   userId: integer("user_id").references(() => usersTable.id, { onDelete: "set null" }),
   bookedBy: integer("booked_by").references(() => usersTable.id, { onDelete: "set null" }),
   originalAmount: integer("original_amount").default(0),
