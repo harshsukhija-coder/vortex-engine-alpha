@@ -98,22 +98,19 @@ function parseTimeToDate(dateStr: string, timeStr: string): Date {
   return new Date(`${kolkataStr}+05:30`);
 }
 
-// Validation Schema for Booking creation (accepts full nested frontend payload or flat payload)
-const bookingSchema = z.object({
-  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID").optional(),
-  setupInstanceId: z.number().int().positive("Invalid setup instance ID").optional(),
-  setupId: z.number().int().positive().optional(),
+// Shared booking fields. Actual and tentative bookings intentionally use different setup identifiers.
+const bookingPayloadSchema = z.object({
   setupName: z.string().optional(),
   consoleType: z.string().optional(),
   customer: z.object({
     name: z.string().optional(),
     phoneNumber: z.string().optional(),
-    dateOfBirth: z.string().optional()
+    dateOfBirth: z.string().nullish()
   }).optional(),
   additionalMembers: z.array(z.object({
     name: z.string().optional(),
     phone: z.string().optional(),
-    dateOfBirth: z.string().optional()
+    dateOfBirth: z.string().nullish()
   })).optional(),
   bookingDetails: z.object({
     playersCount: z.number().int().positive().optional(),
@@ -156,6 +153,14 @@ const bookingSchema = z.object({
   appliedOfferIds: z.array(z.number().int().positive()).optional(),
   cashAmount: z.number().nonnegative().optional(),
   upiAmount: z.number().nonnegative().optional()
+});
+
+const actualBookingSchema = bookingPayloadSchema.extend({
+  setupInstanceId: z.number().int().positive("Invalid setup instance ID")
+});
+
+const tentativeBookingSchema = bookingPayloadSchema.extend({
+  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID")
 });
 
 // 1. GET /api/games - List active games, optionally filtered by setup configuration
@@ -309,21 +314,20 @@ api.get('/offers', async (c) => {
   });
 });
 
-// Validation schema for offer evaluation (accepts both nested frontend payload and flat payload)
-const evaluateOfferSchema = z.object({
-  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID").optional(),
-  setupId: z.number().int().positive().optional(),
+// Actual-booking pricing and offer evaluation always targets a physical setup instance.
+const actualReviewSchema = z.object({
+  setupInstanceId: z.number().int().positive("Invalid setup instance ID"),
   setupName: z.string().optional(),
   consoleType: z.string().optional(),
   customer: z.object({
     name: z.string().optional(),
     phoneNumber: z.string().optional(),
-    dateOfBirth: z.string().optional()
+    dateOfBirth: z.string().nullish()
   }).optional(),
   additionalMembers: z.array(z.object({
     name: z.string().optional(),
     phone: z.string().optional(),
-    dateOfBirth: z.string().optional()
+    dateOfBirth: z.string().nullish()
   })).optional(),
   bookingDetails: z.object({
     playersCount: z.number().int().positive().optional(),
@@ -450,16 +454,12 @@ function evaluatePromotions(params: {
 async function handleOffersEvaluation(c: any) {
   try {
     const body = await c.req.json();
-    const validated = evaluateOfferSchema.safeParse(body);
+    const validated = actualReviewSchema.safeParse(body);
     if (!validated.success) {
       return c.json({ success: false, error: "Validation failed", details: validated.error.format() }, 400);
     }
 
     const data = validated.data;
-    const setupConfigurationId = data.setupConfigurationId ?? data.setupId;
-    if (!setupConfigurationId) {
-      return c.json({ success: false, error: "setupConfigurationId is required" }, 400);
-    }
     const bDetails = data.bookingDetails || {};
 
     const playersCount = bDetails.playersCount ?? bDetails.count ?? data.playersCount ?? data.count ?? (1 + (data.additionalMembers?.length || 0));
@@ -467,9 +467,19 @@ async function handleOffersEvaluation(c: any) {
     const startTimeStr = bDetails.startTime ?? data.startTime ?? "12:00 PM";
     const durationHours = bDetails.noOfHours ?? data.noOfHours ?? 1;
 
+    const [setupInstance] = await db.select().from(setupsTable).where(
+      and(
+        eq(setupsTable.id, data.setupInstanceId),
+        eq(setupsTable.isActive, true)
+      )
+    );
+    if (!setupInstance) {
+      return c.json({ success: false, error: "Setup instance not found or inactive" }, 404);
+    }
+
     const [config] = await db.select().from(setupConfigurationsTable).where(
       and(
-        eq(setupConfigurationsTable.id, setupConfigurationId),
+        eq(setupConfigurationsTable.id, setupInstance.setupConfigurationId),
         eq(setupConfigurationsTable.isActive, true)
       )
     );
@@ -500,7 +510,9 @@ async function handleOffersEvaluation(c: any) {
     return c.json({
       success: true,
       setup: {
-        id: setup.id,
+        setupInstanceId: setupInstance.id,
+        setupConfigurationId: setup.id,
+        instanceName: setupInstance.name,
         name: setup.name,
         consoleType: setup.consoleType,
         singlePlayerPrice: setup.singlePlayerPrice,
@@ -528,28 +540,22 @@ async function handleOffersEvaluation(c: any) {
   }
 }
 
-// 3b. POST /api/offers/evaluate - Evaluate eligible and ineligible offers based on checkout details (Public)
-api.post('/offers/evaluate', handleOffersEvaluation);
+// 3b. POST /api/offers/evaluate - Evaluate offers for an actual booking (Admin only)
+api.post('/offers/evaluate', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), handleOffersEvaluation);
 
-// 3c. POST /api/offers/applicable - Alias for evaluate offers
-api.post('/offers/applicable', handleOffersEvaluation);
+// 3c. POST /api/offers/applicable - Alias for actual-booking offer evaluation
+api.post('/offers/applicable', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), handleOffersEvaluation);
 
-const reviewSchema = evaluateOfferSchema;
-
-// 3c. POST /api/bookings/review - Review session details, calculate discount, formatting details (Public)
-api.post('/bookings/review', async (c) => {
+// 3c. POST /api/bookings/review - Review an actual instance booking (Admin only)
+api.post('/bookings/review', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
   try {
     const body = await c.req.json();
-    const validated = reviewSchema.safeParse(body);
+    const validated = actualReviewSchema.safeParse(body);
     if (!validated.success) {
       return c.json({ success: false, error: "Validation failed", details: validated.error.format() }, 400);
     }
     const data = validated.data;
     const bDetails = data.bookingDetails || {};
-    const setupConfigurationId = data.setupConfigurationId ?? data.setupId;
-    if (!setupConfigurationId) {
-      return c.json({ success: false, error: "setupConfigurationId is required" }, 400);
-    }
     const count = bDetails.playersCount ?? bDetails.count ?? data.playersCount ?? data.count ?? (1 + (data.additionalMembers?.length || 0));
     const date = bDetails.date ?? data.date ?? new Date().toISOString().slice(0, 10);
     const startTime = bDetails.startTime ?? data.startTime ?? "12:00 PM";
@@ -557,9 +563,19 @@ api.post('/bookings/review', async (c) => {
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
     const appliedOfferIds = data.appliedOfferIds;
 
+    const [setupInstance] = await db.select().from(setupsTable).where(
+      and(
+        eq(setupsTable.id, data.setupInstanceId),
+        eq(setupsTable.isActive, true)
+      )
+    );
+    if (!setupInstance) {
+      return c.json({ success: false, error: "Setup instance not found or inactive" }, 404);
+    }
+
     const [config] = await db.select().from(setupConfigurationsTable).where(
       and(
-        eq(setupConfigurationsTable.id, setupConfigurationId),
+        eq(setupConfigurationsTable.id, setupInstance.setupConfigurationId),
         eq(setupConfigurationsTable.isActive, true)
       )
     );
@@ -647,14 +663,14 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     const jwtPayload = c.get('jwtPayload') as any;
     const adminId = jwtPayload?.id;
     const body = await c.req.json();
-    const result = bookingSchema.safeParse(body);
+    const result = actualBookingSchema.safeParse(body);
 
     if (!result.success) {
       return c.json({ success: false, error: "Validation failed", details: result.error.format() }, 400);
     }
 
     const data = result.data;
-    const setupInstanceId = data.setupInstanceId ?? data.setupId ?? 1;
+    const setupInstanceId = data.setupInstanceId;
 
     // Extract customer info
     const customer = data.customer || {};
@@ -975,17 +991,14 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
     const jwtPayload = c.get('jwtPayload') as any;
     const adminId = jwtPayload?.id;
     const body = await c.req.json();
-    const result = bookingSchema.safeParse(body);
+    const result = tentativeBookingSchema.safeParse(body);
 
     if (!result.success) {
       return c.json({ success: false, error: "Validation failed", details: result.error.format() }, 400);
     }
 
     const data = result.data;
-    const setupConfigurationId = data.setupConfigurationId ?? data.setupId;
-    if (!setupConfigurationId) {
-      return c.json({ success: false, error: "setupConfigurationId is required" }, 400);
-    }
+    const setupConfigurationId = data.setupConfigurationId;
     const customer = data.customer || {};
     const phoneNumber = customer.phoneNumber ?? data.phoneNumber ?? "";
     if (!phoneNumber) {
