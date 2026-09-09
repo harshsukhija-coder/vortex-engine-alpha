@@ -666,7 +666,15 @@ api.post('/offers/evaluate', async (c) => {
   }
 });
 
-// 3c. POST /api/offers/applicable - Actual instance evaluation (Admin only)
+// 3c. POST /api/offers/evaluate/actual - Actual physical-instance evaluation (Admin only)
+api.post(
+  '/offers/evaluate/actual',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  handleOffersEvaluation
+);
+
+// Backwards-compatible alias for actual physical-instance evaluation
 api.post('/offers/applicable', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), handleOffersEvaluation);
 
 // 3c. POST /api/bookings/review - Public, read-only booking preview
@@ -684,27 +692,30 @@ api.post('/bookings/review', async (c) => {
     const startTime = bDetails.startTime ?? data.startTime ?? "12:00 PM";
     const noOfHours = bDetails.noOfHours ?? data.noOfHours ?? 1;
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
-    const appliedOfferIds = data.appliedOfferIds;
+    const appliedOfferIds = data.appliedOfferIds ?? [];
 
-    let setupConfigurationId = data.setupConfigurationId;
-    if (setupConfigurationId === undefined) {
-      const setupInstanceId = data.setupInstanceId;
-      if (setupInstanceId === undefined) {
-        return c.json(
-          { success: false, error: "setupInstanceId or setupConfigurationId is required" },
-          400
-        );
-      }
-      const [setupInstance] = await db.select().from(setupsTable).where(
+    const setupInstance = data.setupInstanceId === undefined
+      ? undefined
+      : (
+        await db.select().from(setupsTable).where(
         and(
-          eq(setupsTable.id, setupInstanceId),
+          eq(setupsTable.id, data.setupInstanceId),
           eq(setupsTable.isActive, true)
         )
+        )
+      )[0];
+
+    if (data.setupInstanceId !== undefined && !setupInstance) {
+      return c.json({ success: false, error: "Setup instance not found or inactive" }, 404);
+    }
+
+    const setupConfigurationId =
+      data.setupConfigurationId ?? setupInstance?.setupConfigurationId;
+    if (setupConfigurationId === undefined) {
+      return c.json(
+        { success: false, error: "setupInstanceId or setupConfigurationId is required" },
+        400
       );
-      if (!setupInstance) {
-        return c.json({ success: false, error: "Setup instance not found or inactive" }, 404);
-      }
-      setupConfigurationId = setupInstance.setupConfigurationId;
     }
 
     const [config] = await db.select().from(setupConfigurationsTable).where(
@@ -715,80 +726,47 @@ api.post('/bookings/review', async (c) => {
     );
     if (!config) return c.json({ success: false, error: "Setup active configuration not found" }, 404);
 
-    const pricing = calculatePriceForRule(config, count, noOfHours);
-    const ratePerPersonPerHour = pricing.ratePerPersonPerHour;
-
-    // 2. Parse and format Date (e.g. Wednesday, 19 August 2026) in Asia/Kolkata
     const minStart = parseTimeToDate(date, startTime);
     const dateOptions: Intl.DateTimeFormatOptions = { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' };
     const dateFormatted = minStart.toLocaleDateString('en-GB', dateOptions);
 
-    // 3. Format Slots dynamically (e.g. 10:00 AM – 11:00 AM) in Asia/Kolkata
     const formattedSlotStrings: string[] = [];
     for (let i = 0; i < noOfHours; i++) {
       const slotStart = new Date(minStart.getTime() + i * 60 * 60 * 1000);
       const slotEnd = new Date(minStart.getTime() + (i + 1) * 60 * 60 * 1000);
       const startStr = slotStart.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
       const endStr = slotEnd.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
-      formattedSlotStrings.push(`${startStr} – ${endStr}`);
-    }
-    const slotsFormatted = formattedSlotStrings.join(', ');
-
-    // 4. Calculate Durations
-    const durationHours = noOfHours;
-
-    // 5. Get Games List
-    let gamesList: string[] = [];
-    if (gameIds && gameIds.length > 0) {
-      const dbGames = await db.select().from(gamesTable);
-      gamesList = dbGames.filter(g => gameIds.includes(g.id)).map(g => g.name);
+      formattedSlotStrings.push(`${startStr} - ${endStr}`);
     }
 
-    // 6. Calculate Price Calculations Text (same single vs multi rates as /price)
-    const priceCalculationText = pricing.calculationFormula;
-
-    // 7. Calculate Pricing & Offers
-    const originalAmount = pricing.basePrice;
-
-    const offerEvaluation = evaluatePromotions({
-      setup: {
-        id: config.id,
-        name: config.name,
-        consoleType: config.consoleType,
-        price: config.price,
-        singlePlayerPrice: config.singlePlayerPrice,
-        multiplayerPrice: config.multiplayerPrice
-      },
-      playersCount: count,
-      dateStr: date,
-      startTimeStr: startTime,
-      durationHours,
-      selectedOfferIds: appliedOfferIds
-    });
+    const selectedGames = gameIds.length === 0
+      ? []
+      : await db
+        .select({ id: gamesTable.id, name: gamesTable.name })
+        .from(gamesTable)
+        .where(inArray(gamesTable.id, gameIds));
+    const selectedOffers = HARDCODED_OFFERS.filter((offer) =>
+      appliedOfferIds.includes(offer.id)
+    );
 
     return c.json({
       success: true,
-      evaluated: true,
       summary: {
+        setup: {
+          setupInstanceId: setupInstance?.id ?? null,
+          setupConfigurationId: config.id,
+          instanceName: setupInstance?.name ?? null,
+          configurationName: config.name,
+          consoleType: config.consoleType
+        },
         date: dateFormatted,
-        slotsFormatted,
+        dateValue: date,
+        startTime,
+        slots: formattedSlotStrings,
         playersCount: count,
-        zoneName: config.name,
-        gamesList,
-        durationHours,
-        priceCalculationText,
-        originalAmount,
-        discountApplied: offerEvaluation.discountApplied,
-        totalAmount: offerEvaluation.totalAmount,
-        appliedPromotions: offerEvaluation.appliedOffers,
-        availablePromotions: offerEvaluation.offers.filter(
-          (offer) =>
-            offer.eligible &&
-            !offerEvaluation.appliedOffers.some((applied) => applied.id === offer.id)
-        ),
-        ineligiblePromotions: offerEvaluation.offers.filter(
-          (offer) => !offer.eligible
-        )
+        durationHours: noOfHours,
+        games: selectedGames,
+        selectedOffers
       }
     });
   } catch (error: any) {
