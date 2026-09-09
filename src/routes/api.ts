@@ -37,7 +37,7 @@ const HARDCODED_OFFERS = [
   {
     id: 2,
     code: "HAPPY_HOURS_MON_THU",
-    name: "HAPPY HOURS — MON–THU | 11 AM–5 PM",
+    name: "HAPPY HOURS, MON-THU | 11 AM-5 PM",
     description: "Rs 60 per hour multiplayer; Rs 70 per hour single player",
     offerType: "EXCLUSIVE" as const
   }
@@ -306,11 +306,16 @@ api.get(
   }
 );
 
-// 3. GET /api/offers - List the hardcoded promotions
+// 3. GET /api/offers - List promotion definitions, without booking eligibility
 api.get('/offers', async (c) => {
   return c.json({
     success: true,
-    offers: HARDCODED_OFFERS
+    evaluated: false,
+    offers: HARDCODED_OFFERS.map((offer) => ({
+      ...offer,
+      eligible: null,
+      reason: "Eligibility requires booking details. Use POST /api/offers/evaluate."
+    }))
   });
 });
 
@@ -344,6 +349,33 @@ const actualReviewSchema = z.object({
   date: z.string().optional(),
   startTime: z.string().optional(),
   noOfHours: z.number().positive().optional(),
+  gameIds: z.array(z.number().int().positive()).optional(),
+  appliedOfferIds: z.array(z.number().int().positive()).optional()
+});
+
+const bookingReviewSchema = actualReviewSchema
+  .extend({
+    setupInstanceId: z.number().int().positive("Invalid setup instance ID").optional(),
+    setupConfigurationId: z
+      .number()
+      .int()
+      .positive("Invalid setup configuration ID")
+      .optional()
+  })
+  .refine(
+    (data) => data.setupInstanceId !== undefined || data.setupConfigurationId !== undefined,
+    {
+      message: "setupInstanceId or setupConfigurationId is required",
+      path: ["setupConfigurationId"]
+    }
+  );
+
+const tentativeOfferEvaluationSchema = z.object({
+  setupConfigurationId: z.number().int().positive("Invalid setup configuration ID"),
+  playersCount: z.number().int().positive(),
+  date: z.string(),
+  startTime: z.string(),
+  noOfHours: z.number().positive(),
   gameIds: z.array(z.number().int().positive()).optional(),
   appliedOfferIds: z.array(z.number().int().positive()).optional()
 });
@@ -383,7 +415,7 @@ function evaluatePromotions(params: {
       : `Requires at least 3 players on the same PS5 (Current: ${playersCount} players)`
   };
 
-  // 2. Offer: HAPPY HOURS — MON–THU | 11 AM–5 PM
+  // 2. Offer: HAPPY HOURS, MON-THU | 11 AM-5 PM
   // Rs 60 per hour multiplayer; Rs 70 per hour single player
   let happyHoursEligible = false;
   let happyHoursReason = "";
@@ -396,14 +428,15 @@ function evaluatePromotions(params: {
     const timeParts = startDate.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
     const [h, m] = timeParts.split(':').map(Number);
     const startMins = h * 60 + m;
+    const endMins = startMins + durationHours * 60;
 
-    // 11:00 AM (660) to 5:00 PM (1020)
-    const isWithinTime = startMins >= 660 && startMins < 1020;
+    // The complete booking must fit within 11:00 AM (660) and 5:00 PM (1020).
+    const isWithinTime = startMins >= 660 && endMins <= 1020;
 
     if (!isMonThu) {
       happyHoursReason = `Valid only Monday to Thursday (Selected date is ${dayStr})`;
     } else if (!isWithinTime) {
-      happyHoursReason = `Valid only between 11:00 AM and 5:00 PM (Selected start time: ${startTimeStr})`;
+      happyHoursReason = `The complete booking must be between 11:00 AM and 5:00 PM (Selected start time: ${startTimeStr}, Duration: ${durationHours} hr)`;
     } else {
       happyHoursEligible = true;
     }
@@ -509,6 +542,7 @@ async function handleOffersEvaluation(c: any) {
 
     return c.json({
       success: true,
+      evaluated: true,
       setup: {
         setupInstanceId: setupInstance.id,
         setupConfigurationId: setup.id,
@@ -540,17 +574,106 @@ async function handleOffersEvaluation(c: any) {
   }
 }
 
-// 3b. POST /api/offers/evaluate - Evaluate offers for an actual booking (Admin only)
-api.post('/offers/evaluate', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), handleOffersEvaluation);
+// 3b. POST /api/offers/evaluate - Public pricing preview for a tentative booking
+api.post('/offers/evaluate', async (c) => {
+  try {
+    const validated = tentativeOfferEvaluationSchema.safeParse(await c.req.json());
+    if (!validated.success) {
+      return c.json(
+        {
+          success: false,
+          error: "Validation failed",
+          details: validated.error.format()
+        },
+        400
+      );
+    }
 
-// 3c. POST /api/offers/applicable - Alias for actual-booking offer evaluation
+    const data = validated.data;
+    const [config] = await db
+      .select()
+      .from(setupConfigurationsTable)
+      .where(
+        and(
+          eq(setupConfigurationsTable.id, data.setupConfigurationId),
+          eq(setupConfigurationsTable.isActive, true)
+        )
+      );
+
+    if (!config) {
+      return c.json(
+        { success: false, error: "Setup configuration not found or inactive" },
+        404
+      );
+    }
+
+    const pricing = calculatePriceForRule(
+      config,
+      data.playersCount,
+      data.noOfHours
+    );
+    const evaluation = evaluatePromotions({
+      setup: {
+        id: config.id,
+        name: config.name,
+        consoleType: config.consoleType,
+        price: config.price,
+        singlePlayerPrice: config.singlePlayerPrice ?? config.price,
+        multiplayerPrice: config.multiplayerPrice ?? config.price
+      },
+      playersCount: data.playersCount,
+      dateStr: data.date,
+      startTimeStr: data.startTime,
+      durationHours: data.noOfHours,
+      selectedOfferIds: data.appliedOfferIds
+    });
+
+    return c.json({
+      success: true,
+      evaluated: true,
+      setup: {
+        setupConfigurationId: config.id,
+        name: config.name,
+        consoleType: config.consoleType,
+        singlePlayerPrice: config.singlePlayerPrice ?? config.price,
+        multiplayerPrice: config.multiplayerPrice ?? config.price
+      },
+      bookingSummary: {
+        playersCount: data.playersCount,
+        date: data.date,
+        startTime: data.startTime,
+        noOfHours: data.noOfHours,
+        ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+        calculationFormula: pricing.calculationFormula,
+        originalAmount: evaluation.originalAmount,
+        discountApplied: evaluation.discountApplied,
+        totalAmount: evaluation.totalAmount
+      },
+      appliedOffers: evaluation.appliedOffers,
+      applicableOffers: evaluation.offers.filter((offer) => offer.eligible),
+      ineligibleOffers: evaluation.offers.filter((offer) => !offer.eligible),
+      offers: evaluation.offers
+    });
+  } catch (error: unknown) {
+    console.error(error);
+    return c.json(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : "Offer evaluation failed"
+      },
+      500
+    );
+  }
+});
+
+// 3c. POST /api/offers/applicable - Actual instance evaluation (Admin only)
 api.post('/offers/applicable', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), handleOffersEvaluation);
 
-// 3c. POST /api/bookings/review - Review an actual instance booking (Admin only)
-api.post('/bookings/review', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
+// 3c. POST /api/bookings/review - Public, read-only booking preview
+api.post('/bookings/review', async (c) => {
   try {
     const body = await c.req.json();
-    const validated = actualReviewSchema.safeParse(body);
+    const validated = bookingReviewSchema.safeParse(body);
     if (!validated.success) {
       return c.json({ success: false, error: "Validation failed", details: validated.error.format() }, 400);
     }
@@ -563,19 +686,30 @@ api.post('/bookings/review', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN'
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
     const appliedOfferIds = data.appliedOfferIds;
 
-    const [setupInstance] = await db.select().from(setupsTable).where(
-      and(
-        eq(setupsTable.id, data.setupInstanceId),
-        eq(setupsTable.isActive, true)
-      )
-    );
-    if (!setupInstance) {
-      return c.json({ success: false, error: "Setup instance not found or inactive" }, 404);
+    let setupConfigurationId = data.setupConfigurationId;
+    if (setupConfigurationId === undefined) {
+      const setupInstanceId = data.setupInstanceId;
+      if (setupInstanceId === undefined) {
+        return c.json(
+          { success: false, error: "setupInstanceId or setupConfigurationId is required" },
+          400
+        );
+      }
+      const [setupInstance] = await db.select().from(setupsTable).where(
+        and(
+          eq(setupsTable.id, setupInstanceId),
+          eq(setupsTable.isActive, true)
+        )
+      );
+      if (!setupInstance) {
+        return c.json({ success: false, error: "Setup instance not found or inactive" }, 404);
+      }
+      setupConfigurationId = setupInstance.setupConfigurationId;
     }
 
     const [config] = await db.select().from(setupConfigurationsTable).where(
       and(
-        eq(setupConfigurationsTable.id, setupInstance.setupConfigurationId),
+        eq(setupConfigurationsTable.id, setupConfigurationId),
         eq(setupConfigurationsTable.isActive, true)
       )
     );
@@ -634,6 +768,7 @@ api.post('/bookings/review', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN'
 
     return c.json({
       success: true,
+      evaluated: true,
       summary: {
         date: dateFormatted,
         slotsFormatted,
@@ -647,7 +782,12 @@ api.post('/bookings/review', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN'
         totalAmount: offerEvaluation.totalAmount,
         appliedPromotions: offerEvaluation.appliedOffers,
         availablePromotions: offerEvaluation.offers.filter(
-          (offer) => !offerEvaluation.appliedOffers.some((applied) => applied.id === offer.id)
+          (offer) =>
+            offer.eligible &&
+            !offerEvaluation.appliedOffers.some((applied) => applied.id === offer.id)
+        ),
+        ineligiblePromotions: offerEvaluation.offers.filter(
+          (offer) => !offer.eligible
         )
       }
     });
