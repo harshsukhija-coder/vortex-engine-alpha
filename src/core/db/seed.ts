@@ -342,7 +342,10 @@ async function seed() {
     { email: 'superadmin@cafe.com', password: 'supersecret', role: 'SUPER_ADMIN' as const },
     { email: 'admin@cafe.com', password: 'adminsecret', role: 'ADMIN' as const },
     { email: 'member@cafe.com', password: 'membersecret', role: 'MEMBER' as const },
-    { email: 'meet@gmail.com', password: 'Meet@1234', role: 'SUPER_ADMIN' as const },
+    { email: 'vishant@gmail.com', password: 'Vishant@9601', role: 'SUPER_ADMIN' as const },
+    { email: 'dhruvang@gmail.com', password: 'Dhruvang@7227', role: 'SUPER_ADMIN' as const },
+    { email: 'devarsh@gmail.com', password: 'Devarsh@8758', role: 'SUPER_ADMIN' as const },
+    { email: 'meet@gmail.com', password: 'Meet@9898', role: 'SUPER_ADMIN' as const },
     { email: 'harsh@gmail.com', password: 'Harsh@1234', role: 'ADMIN' as const },
     { email: 'ravi@gmail.com', password: 'Ravi@1234', role: 'ADMIN' as const }
   ];
@@ -354,7 +357,15 @@ async function seed() {
       .where(eq(usersTable.email, u.email));
 
     if (existing.length > 0) {
-      console.log(`User "${u.email}" already exists.`);
+      await db
+        .update(usersTable)
+        .set({
+          passwordHash: hashPassword(u.password),
+          role: u.role,
+          updatedAt: new Date()
+        })
+        .where(eq(usersTable.email, u.email));
+      console.log(`Updated user "${u.email}" with role "${u.role}"`);
     } else {
       const passwordHash = hashPassword(u.password);
       await db

@@ -37,6 +37,9 @@ export const setupsTable = pgTable("setups", {
   images: text().array().notNull().default(sql`'{}'::text[]`),
   videos: text().array().notNull().default(sql`'{}'::text[]`),
   isActive: boolean("is_active").notNull().default(true),
+  previousSessionTerminatedSuccessfully: boolean(
+    "previous_session_terminated_successfully"
+  ).notNull().default(true),
   createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
 });
@@ -82,7 +85,12 @@ export const offerDetailsTable = pgTable("offer_details", {
 
 // User Roles & Users
 export const userRoleEnum = pgEnum('user_role', ['MEMBER', 'ADMIN', 'SUPER_ADMIN']);
-export const bookingStatusEnum = pgEnum('booking_status', ['TENTATIVE', 'CONFIRMED', 'CANCELLED']);
+export const bookingStatusEnum = pgEnum('booking_status', [
+  'TENTATIVE',
+  'CONFIRMED',
+  'COMPLETED',
+  'CANCELLED'
+]);
 
 export const usersTable = pgTable("users", {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),

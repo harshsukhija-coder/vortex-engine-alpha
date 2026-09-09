@@ -25,6 +25,7 @@ import { calculatePriceForRule } from '../core/pricing.js';
 const api = new Hono();
 
 class BookingConflictError extends Error {}
+class SessionTerminationRequiredError extends Error {}
 
 const HARDCODED_OFFERS = [
   {
@@ -941,6 +942,18 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
 
     // 5. Database transaction to check overlap and create confirmed booking
     const booking = await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${setupInstanceId})`);
+
+      const [lockedSetup] = await tx
+        .select()
+        .from(setupsTable)
+        .where(eq(setupsTable.id, setupInstanceId));
+      if (!lockedSetup?.previousSessionTerminatedSuccessfully) {
+        throw new SessionTerminationRequiredError(
+          "The previous session on this setup instance was not terminated successfully."
+        );
+      }
+
       // 5a. Check existing booking overlap (confirmed)
       const [existingBooking] = await tx
         .select()
@@ -1024,6 +1037,14 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           .values({ bookingId: insertedBooking.id, offerId: offer.id });
       }
 
+      await tx
+        .update(setupsTable)
+        .set({
+          previousSessionTerminatedSuccessfully: false,
+          updatedAt: new Date()
+        })
+        .where(eq(setupsTable.id, setupInstanceId));
+
       return insertedBooking;
     });
 
@@ -1099,6 +1120,9 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     });
   } catch (error: any) {
     console.error(error);
+    if (error instanceof SessionTerminationRequiredError) {
+      return c.json({ success: false, error: error.message }, 409);
+    }
     return c.json({ success: false, error: error.message }, 500);
   }
 });
@@ -1387,6 +1411,11 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
       if (setupDb.setupConfigurationId !== tentative.setupConfigurationId) {
         throw new Error("Assigned setup instance does not belong to the tentative booking configuration");
       }
+      if (!setupDb.previousSessionTerminatedSuccessfully) {
+        throw new SessionTerminationRequiredError(
+          "The previous session on this setup instance was not terminated successfully."
+        );
+      }
 
       // Determine the session timings
       const finalStartTime = startTime ? new Date(startTime) : new Date(tentative.startTime);
@@ -1517,6 +1546,14 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
         .delete(tentativeBookingTable)
         .where(eq(tentativeBookingTable.id, id));
 
+      await tx
+        .update(setupsTable)
+        .set({
+          previousSessionTerminatedSuccessfully: false,
+          updatedAt: new Date()
+        })
+        .where(eq(setupsTable.id, setupInstanceId));
+
       return booking;
     });
 
@@ -1543,6 +1580,9 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
     });
   } catch (error: any) {
     console.error(error);
+    if (error instanceof SessionTerminationRequiredError) {
+      return c.json({ success: false, error: error.message }, 409);
+    }
     return c.json({ success: false, error: error.message }, 400);
   }
 });
@@ -1599,7 +1639,7 @@ api.get('/bookings', authMiddleware, async (c) => {
 
 // 5c. PATCH /api/bookings/:id/status - Update booking status (Requires ADMIN or SUPER_ADMIN)
 const updateBookingStatusSchema = z.object({
-  status: z.enum(['TENTATIVE', 'CONFIRMED', 'CANCELLED'], { message: "Invalid status value" }),
+  status: z.enum(['TENTATIVE', 'CONFIRMED', 'COMPLETED', 'CANCELLED'], { message: "Invalid status value" }),
   actualStartTime: z.string().datetime().optional(),
   actualEndTime: z.string().datetime().optional()
 });
@@ -1971,60 +2011,76 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
   }
 });
 
+const terminateSessionSchema = z.object({
+  actualStartTime: z.string().datetime().optional(),
+  actualEndTime: z.string().datetime().optional(),
+  finalAmountCharged: z.number().int().nonnegative().optional(),
+  cashAmount: z.number().int().nonnegative().optional(),
+  upiAmount: z.number().int().nonnegative().optional()
+});
+
 // Comprehensive Session End Logic with Full Summary
 async function handleEndSessionLogic(params: {
   bookingId?: number;
   setupId?: number;
   adminId?: number;
+  actualStartTime?: Date;
+  actualEndTime?: Date;
+  finalAmountCharged?: number;
+  cashAmount?: number;
+  upiAmount?: number;
 }) {
-  const { bookingId, setupId, adminId } = params;
+  const {
+    bookingId,
+    setupId,
+    adminId,
+    actualStartTime: requestedActualStartTime,
+    actualEndTime: requestedActualEndTime,
+    finalAmountCharged: requestedFinalAmountCharged,
+    cashAmount: requestedCashAmount,
+    upiAmount: requestedUpiAmount
+  } = params;
   const now = new Date();
 
-  // 1. Find target booking
+  // Only a currently active confirmed booking can be terminated.
   let booking: any = null;
   if (bookingId) {
-    const [b] = await db.select().from(bookingTable).where(eq(bookingTable.id, bookingId));
+    const [b] = await db
+      .select()
+      .from(bookingTable)
+      .where(
+        and(
+          eq(bookingTable.id, bookingId),
+          eq(bookingTable.status, 'CONFIRMED'),
+          isNull(bookingTable.actualEndTime)
+        )
+      );
     booking = b;
   } else if (setupId) {
-    // Find active booking on this setup instance
     const [b] = await db
       .select()
       .from(bookingTable)
       .where(
         and(
           eq(bookingTable.setupId, setupId),
-          ne(bookingTable.status, 'CANCELLED'),
+          eq(bookingTable.status, 'CONFIRMED'),
           isNull(bookingTable.actualEndTime)
         )
       )
       .orderBy(desc(bookingTable.createdAt))
       .limit(1);
-
-    if (b) {
-      booking = b;
-    } else {
-      // Fallback: look for most recent confirmed booking on that setup
-      const [recent] = await db
-        .select()
-        .from(bookingTable)
-        .where(
-          and(
-            eq(bookingTable.setupId, setupId),
-            ne(bookingTable.status, 'CANCELLED')
-          )
-        )
-        .orderBy(desc(bookingTable.createdAt))
-        .limit(1);
-      booking = recent;
-    }
+    booking = b;
   }
 
   if (!booking) {
-    throw new Error(bookingId ? `Booking #${bookingId} not found` : `No active booking session found on Setup #${setupId}`);
+    throw new Error(
+      bookingId
+        ? `Booking #${bookingId} is not an active confirmed session`
+        : `No active confirmed session found on Setup #${setupId}`
+    );
   }
-
-  if (booking.status === 'CANCELLED') {
-    throw new Error("Cannot end session for a cancelled booking");
+  if (booking.setupId === null) {
+    throw new Error(`Booking #${booking.id} has no assigned setup instance`);
   }
 
   const snapshot = (booking.setupSnapshot as Record<string, any> | null) || {};
@@ -2036,8 +2092,28 @@ async function handleEndSessionLogic(params: {
   const multiPrice = snapshot.multiplayerPrice ?? snapshot.chargePerPersonPerHour ?? snapshot.price ?? 120;
   const ratePerPersonPerHour = isSingle ? singlePrice : multiPrice;
 
-  const actualStartTime = new Date(booking.actualStartTime || booking.startTime);
-  const actualEndTime = now;
+  const actualStartTime = requestedActualStartTime
+    ? new Date(requestedActualStartTime)
+    : new Date(booking.actualStartTime || booking.startTime);
+  if (Number.isNaN(actualStartTime.getTime())) {
+    throw new Error("Invalid actual start time");
+  }
+  // Booking requests use minute precision, so persist termination at the same precision.
+  const actualEndTime = requestedActualEndTime
+    ? new Date(requestedActualEndTime)
+    : new Date(now);
+  if (!requestedActualEndTime) {
+    actualEndTime.setSeconds(0, 0);
+  }
+  if (Number.isNaN(actualEndTime.getTime())) {
+    throw new Error("Invalid actual end time");
+  }
+  if (actualEndTime <= actualStartTime) {
+    throw new Error("Cannot terminate a session before it starts");
+  }
+  if (actualEndTime > now) {
+    throw new Error("Actual end time cannot be in the future");
+  }
 
   // Calculate elapsed time (minimum 15 mins, rounded up to nearest 15 mins)
   const elapsedMs = Math.max(0, actualEndTime.getTime() - actualStartTime.getTime());
@@ -2077,35 +2153,73 @@ async function handleEndSessionLogic(params: {
   });
 
   const appliedOffers = offerEvaluation.appliedOffers;
-  const discountApplied = offerEvaluation.discountApplied;
-  const finalAmountCharged = offerEvaluation.totalAmount;
+  const calculatedAmountCharged = offerEvaluation.totalAmount;
+  const finalAmountCharged =
+    requestedFinalAmountCharged ?? calculatedAmountCharged;
+  const discountApplied = Math.max(0, finalOriginalAmount - finalAmountCharged);
 
-  const initialAmountPaid = (booking.cashAmount || 0) + (booking.upiAmount || 0) || (booking.amountCharged || 0);
-  const balanceDiff = initialAmountPaid - finalAmountCharged;
+  const hasPaymentOverride =
+    requestedCashAmount !== undefined || requestedUpiAmount !== undefined;
+  const cashAmount = hasPaymentOverride
+    ? requestedCashAmount ?? 0
+    : booking.cashAmount ?? 0;
+  const upiAmount = hasPaymentOverride
+    ? requestedUpiAmount ?? 0
+    : booking.upiAmount ?? 0;
+  const amountPaid = cashAmount + upiAmount;
+  const balanceDiff = amountPaid - finalAmountCharged;
 
   let settlementStatus = "SETTLED";
   let settlementNote = "Session completed and settled in full.";
   if (balanceDiff > 0) {
     settlementStatus = "REFUND_DUE";
-    settlementNote = `Customer overpaid by ₹${balanceDiff} due to early session completion (Paid ₹${initialAmountPaid}, Final ₹${finalAmountCharged}).`;
+    settlementNote = `Customer overpaid by ₹${balanceDiff} due to early session completion (Paid ₹${amountPaid}, Final ₹${finalAmountCharged}).`;
   } else if (balanceDiff < 0) {
     settlementStatus = "PAYMENT_DUE";
     settlementNote = `Additional ₹${Math.abs(balanceDiff)} due for payment.`;
   }
 
-  // Database update: end time set to now to release setup immediately
-  const [updatedBooking] = await db
-    .update(bookingTable)
-    .set({
-      endTime: actualEndTime,
-      actualEndTime: actualEndTime,
-      originalAmount: finalOriginalAmount,
-      amountCharged: finalAmountCharged,
-      status: 'CONFIRMED',
-      updatedAt: now
-    })
-    .where(eq(bookingTable.id, booking.id))
-    .returning();
+  // Persist the completed interval atomically everywhere occupancy is stored.
+  const updatedBooking = await db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(${booking.setupId})`);
+
+    const [updated] = await tx
+      .update(bookingTable)
+      .set({
+        startTime: actualStartTime,
+        endTime: actualEndTime,
+        actualStartTime,
+        actualEndTime,
+        originalAmount: finalOriginalAmount,
+        amountCharged: finalAmountCharged,
+        cashAmount,
+        upiAmount,
+        status: 'COMPLETED',
+        updatedAt: now
+      })
+      .where(eq(bookingTable.id, booking.id))
+      .returning();
+
+    await tx
+      .delete(bookingSlotsTable)
+      .where(eq(bookingSlotsTable.bookingId, booking.id));
+
+    await tx.insert(bookingSlotsTable).values({
+      bookingId: booking.id,
+      startTime: actualStartTime,
+      endTime: actualEndTime
+    });
+
+    await tx
+      .update(setupsTable)
+      .set({
+        previousSessionTerminatedSuccessfully: true,
+        updatedAt: now
+      })
+      .where(eq(setupsTable.id, booking.setupId));
+
+    return updated;
+  });
 
   // Fetch Customer profile
   const [customer] = await db
@@ -2172,9 +2286,11 @@ async function handleEndSessionLogic(params: {
         ratePerPersonPerHour,
         calculationFormula: `₹${ratePerPersonPerHour}/player/hr × ${count} player(s) × ${actualDurationHours} hr(s) = ₹${finalOriginalAmount}`,
         originalAmount: finalOriginalAmount,
+        calculatedAmountCharged,
+        amountAdjustedManually: requestedFinalAmountCharged !== undefined,
         discountApplied,
         finalAmountCharged,
-        initialAmountPaid,
+        amountPaid,
         settlement: {
           status: settlementStatus,
           amount: Math.abs(balanceDiff),
@@ -2189,6 +2305,12 @@ async function handleEndSessionLogic(params: {
         email: adminUser.email,
         role: adminUser.role
       } : null,
+      instanceSessionState: {
+        previousSessionTerminatedSuccessfully: true,
+        canCreateNewSession: true,
+        requiresTermination: false,
+        canTerminate: false
+      },
       completedAt: actualEndTime.toISOString()
     }
   };
@@ -2229,6 +2351,141 @@ api.post('/setups/:setupId/terminate', authMiddleware, requireRole(['ADMIN', 'SU
     return c.json({ success: false, error: error.message }, 400);
   }
 });
+
+// GET /api/setup-instances/:id/terminate-session - Load previous session and termination state
+api.get(
+  '/setup-instances/:id/terminate-session',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  async (c) => {
+    try {
+      const setupInstanceId = Number(c.req.param('id'));
+      if (!Number.isInteger(setupInstanceId) || setupInstanceId <= 0) {
+        return c.json({ success: false, error: "Invalid setup instance ID" }, 400);
+      }
+
+      const [setupInstance] = await db
+        .select()
+        .from(setupsTable)
+        .where(eq(setupsTable.id, setupInstanceId));
+      if (!setupInstance) {
+        return c.json({ success: false, error: "Setup instance not found" }, 404);
+      }
+
+      const [previousSession] = await db
+        .select()
+        .from(bookingTable)
+        .where(eq(bookingTable.setupId, setupInstanceId))
+        .orderBy(desc(bookingTable.createdAt))
+        .limit(1);
+
+      const terminatedSuccessfully =
+        setupInstance.previousSessionTerminatedSuccessfully;
+      const canTerminate =
+        previousSession?.status === 'CONFIRMED' &&
+        previousSession.actualEndTime === null &&
+        !terminatedSuccessfully;
+
+      return c.json({
+        success: true,
+        setupInstance: {
+          id: setupInstance.id,
+          name: setupInstance.name,
+          setupConfigurationId: setupInstance.setupConfigurationId,
+          isActive: setupInstance.isActive
+        },
+        previousSessionTerminatedSuccessfully: terminatedSuccessfully,
+        canCreateNewSession: setupInstance.isActive && terminatedSuccessfully,
+        requiresTermination: !terminatedSuccessfully,
+        canTerminate,
+        acceptedAdjustments: {
+          actualStartTime: "ISO-8601 datetime, optional",
+          actualEndTime: "ISO-8601 datetime, optional",
+          finalAmountCharged: "Nonnegative integer, optional",
+          cashAmount: "Nonnegative integer, optional",
+          upiAmount: "Nonnegative integer, optional"
+        },
+        previousSession: previousSession
+          ? {
+            bookingId: previousSession.id,
+            status: previousSession.status,
+            phoneNumber: previousSession.phoneNumber,
+            playersCount: previousSession.count,
+            scheduledStartTime: previousSession.startTime,
+            scheduledEndTime: previousSession.endTime,
+            actualStartTime: previousSession.actualStartTime,
+            actualEndTime: previousSession.actualEndTime,
+            originalAmount: previousSession.originalAmount,
+            amountCharged: previousSession.amountCharged,
+            createdAt: previousSession.createdAt,
+            updatedAt: previousSession.updatedAt
+          }
+          : null
+      });
+    } catch (error: unknown) {
+      console.error(error);
+      return c.json(
+        {
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to load session status"
+        },
+        500
+      );
+    }
+  }
+);
+
+// POST /api/setup-instances/:id/terminate-session - Atomically complete the active session
+api.post(
+  '/setup-instances/:id/terminate-session',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  async (c) => {
+    try {
+      const setupId = Number(c.req.param('id'));
+      if (!Number.isInteger(setupId) || setupId <= 0) {
+        return c.json({ success: false, error: "Invalid setup instance ID" }, 400);
+      }
+      const validated = terminateSessionSchema.safeParse(
+        await c.req.json().catch(() => ({}))
+      );
+      if (!validated.success) {
+        return c.json(
+          {
+            success: false,
+            error: "Validation failed",
+            details: validated.error.format()
+          },
+          400
+        );
+      }
+      const jwtPayload = c.get('jwtPayload') as { id?: number };
+      const result = await handleEndSessionLogic({
+        setupId,
+        adminId: jwtPayload?.id,
+        actualStartTime: validated.data.actualStartTime
+          ? new Date(validated.data.actualStartTime)
+          : undefined,
+        actualEndTime: validated.data.actualEndTime
+          ? new Date(validated.data.actualEndTime)
+          : undefined,
+        finalAmountCharged: validated.data.finalAmountCharged,
+        cashAmount: validated.data.cashAmount,
+        upiAmount: validated.data.upiAmount
+      });
+      return c.json(result);
+    } catch (error: unknown) {
+      console.error(error);
+      return c.json(
+        {
+          success: false,
+          error: error instanceof Error ? error.message : "Failed to terminate session"
+        },
+        400
+      );
+    }
+  }
+);
 
 // 5f. POST /api/bookings/:id/end-session - End session for a booking ID (Restricted to Admin/Super Admin)
 api.post('/bookings/:id/end-session', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
