@@ -12,6 +12,7 @@ export interface AnalyticsRange {
 
 interface AnalyticsQueryRow {
   overview: Record<string, unknown>;
+  playerCountBreakdown: Array<Record<string, unknown>>;
   ageGroups: Array<Record<string, unknown>>;
   consoleInstances: Array<Record<string, unknown>>;
   games: Array<Record<string, unknown>>;
@@ -26,6 +27,7 @@ export interface SessionAnalytics {
   generatedAt: string;
   range: AnalyticsRange;
   overview: Record<string, unknown>;
+  playerCountBreakdown: Array<Record<string, unknown>>;
   ageGroups: Array<Record<string, unknown>>;
   consoleInstances: Array<Record<string, unknown>>;
   games: Array<Record<string, unknown>>;
@@ -180,6 +182,41 @@ SELECT
     )
     FROM filtered_sessions
   ) AS overview,
+  (
+    SELECT jsonb_build_array(
+      jsonb_build_object(
+        'playersCount', 1,
+        'label', 'SINGLE',
+        'sessions', COUNT(*) FILTER (WHERE count = 1)::integer,
+        'playerVisits', COALESCE(SUM(count) FILTER (WHERE count = 1), 0)::integer
+      ),
+      jsonb_build_object(
+        'playersCount', 2,
+        'label', 'DOUBLE',
+        'sessions', COUNT(*) FILTER (WHERE count = 2)::integer,
+        'playerVisits', COALESCE(SUM(count) FILTER (WHERE count = 2), 0)::integer
+      ),
+      jsonb_build_object(
+        'playersCount', 3,
+        'label', 'TRIPLE',
+        'sessions', COUNT(*) FILTER (WHERE count = 3)::integer,
+        'playerVisits', COALESCE(SUM(count) FILTER (WHERE count = 3), 0)::integer
+      ),
+      jsonb_build_object(
+        'playersCount', 4,
+        'label', 'FOUR',
+        'sessions', COUNT(*) FILTER (WHERE count = 4)::integer,
+        'playerVisits', COALESCE(SUM(count) FILTER (WHERE count = 4), 0)::integer
+      ),
+      jsonb_build_object(
+        'playersCount', 5,
+        'label', 'FIVE_OR_MORE',
+        'sessions', COUNT(*) FILTER (WHERE count >= 5)::integer,
+        'playerVisits', COALESCE(SUM(count) FILTER (WHERE count >= 5), 0)::integer
+      )
+    )
+    FROM filtered_sessions
+  ) AS "playerCountBreakdown",
   (
     SELECT jsonb_build_array(
       jsonb_build_object('ageGroup', '0-10', 'playerVisits', COUNT(*) FILTER (WHERE customer_age >= 0 AND customer_age < 10)::integer),
@@ -345,6 +382,7 @@ export async function getSessionAnalytics(
     generatedAt: new Date().toISOString(),
     range,
     overview: result.overview,
+    playerCountBreakdown: result.playerCountBreakdown,
     ageGroups: result.ageGroups,
     consoleInstances: result.consoleInstances,
     games: result.games,
