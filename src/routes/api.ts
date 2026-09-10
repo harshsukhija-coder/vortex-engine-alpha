@@ -1385,7 +1385,13 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
       return c.json({ success: false, error: "Validation failed", details: validated.error.format() }, 400);
     }
 
-    const { setupInstanceId, cashAmount = 0, upiAmount = 0, startTime, endTime } = validated.data;
+    const {
+      setupInstanceId,
+      cashAmount: requestedCashAmount,
+      upiAmount: requestedUpiAmount,
+      startTime,
+      endTime
+    } = validated.data;
 
     const result = await db.transaction(async (tx) => {
       // 1. Fetch tentative booking
@@ -1447,10 +1453,10 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
       }
 
       const finalAmountCharged = tentative.amountCharged || 0;
-      if (
-        (body.cashAmount !== undefined || body.upiAmount !== undefined) &&
-        cashAmount + upiAmount !== finalAmountCharged
-      ) {
+      const cashAmount = requestedCashAmount
+        ?? (requestedUpiAmount === undefined ? finalAmountCharged : 0);
+      const upiAmount = requestedUpiAmount ?? 0;
+      if (cashAmount + upiAmount !== finalAmountCharged) {
         throw new Error(`Payment total must equal the booking amount of ₹${finalAmountCharged}`);
       }
 
@@ -2160,23 +2166,22 @@ async function handleEndSessionLogic(params: {
 
   const hasPaymentOverride =
     requestedCashAmount !== undefined || requestedUpiAmount !== undefined;
+  const previousCashAmount = booking.cashAmount ?? 0;
+  const previousUpiAmount = booking.upiAmount ?? 0;
+  const previousPaymentTotal = previousCashAmount + previousUpiAmount;
   const cashAmount = hasPaymentOverride
     ? requestedCashAmount ?? 0
-    : booking.cashAmount ?? 0;
+    : previousPaymentTotal > 0
+      ? Math.round(finalAmountCharged * previousCashAmount / previousPaymentTotal)
+      : finalAmountCharged;
   const upiAmount = hasPaymentOverride
     ? requestedUpiAmount ?? 0
-    : booking.upiAmount ?? 0;
+    : finalAmountCharged - cashAmount;
   const amountPaid = cashAmount + upiAmount;
-  const balanceDiff = amountPaid - finalAmountCharged;
-
-  let settlementStatus = "SETTLED";
-  let settlementNote = "Session completed and settled in full.";
-  if (balanceDiff > 0) {
-    settlementStatus = "REFUND_DUE";
-    settlementNote = `Customer overpaid by ₹${balanceDiff} due to early session completion (Paid ₹${amountPaid}, Final ₹${finalAmountCharged}).`;
-  } else if (balanceDiff < 0) {
-    settlementStatus = "PAYMENT_DUE";
-    settlementNote = `Additional ₹${Math.abs(balanceDiff)} due for payment.`;
+  if (amountPaid !== finalAmountCharged) {
+    throw new Error(
+      `Payment total must equal the final session amount of ₹${finalAmountCharged}`
+    );
   }
 
   // Persist the completed interval atomically everywhere occupancy is stored.
@@ -2292,9 +2297,9 @@ async function handleEndSessionLogic(params: {
         finalAmountCharged,
         amountPaid,
         settlement: {
-          status: settlementStatus,
-          amount: Math.abs(balanceDiff),
-          note: settlementNote
+          status: "SETTLED",
+          amount: 0,
+          note: "Session completed and settled in full."
         },
         cashAmount: updatedBooking.cashAmount,
         upiAmount: updatedBooking.upiAmount
@@ -3161,10 +3166,10 @@ api.get('/setup-instances/occupancy', authMiddleware, requireRole(['ADMIN', 'SUP
 const pastSessionsQuerySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in format YYYY-MM-DD").optional(),
   setupInstanceId: z.string().transform((val) => parseInt(val, 10)).pipe(z.number().int().positive()).optional(),
-  status: z.enum(['ALL', 'CONFIRMED', 'CANCELLED']).optional().default('ALL')
+  status: z.enum(['ALL', 'CONFIRMED', 'COMPLETED', 'CANCELLED']).optional().default('ALL')
 });
 
-api.get('/sessions/past', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
+api.get('/sessions/past', authMiddleware, requireRole(['SUPER_ADMIN']), async (c) => {
   try {
     const query = c.req.query();
     const validated = pastSessionsQuerySchema.safeParse(query);

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { boolean, doublePrecision, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
+import { boolean, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
 
 // Games
 export const gamesTable = pgTable("games", {
@@ -127,7 +127,17 @@ export const bookingTable = pgTable('booking_tables', {
   actualEndTime: timestamp("actual_end_time", { precision: 6, withTimezone: true }),
   createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
-});
+}, (table) => ({
+  startTimeIdx: index("booking_tables_start_time_idx").on(table.startTime),
+  setupStartTimeIdx: index("booking_tables_setup_start_time_idx").on(
+    table.setupId,
+    table.startTime
+  ),
+  phoneStartTimeIdx: index("booking_tables_phone_start_time_idx").on(
+    table.phoneNumber,
+    table.startTime
+  )
+}));
 
 // Booking and offers
 export const bookingAndOffersTable = pgTable("booking_offers", {
@@ -146,7 +156,8 @@ export const bookingAndGames = pgTable("booking_games", {
 }, (table) => ({
   pk: primaryKey({
     columns: [table.bookingId, table.gameId]
-  })
+  }),
+  gameIdIdx: index("booking_games_game_id_idx").on(table.gameId)
 }));
 
 // Slot Locks (PostgreSQL-based temporary locking)
