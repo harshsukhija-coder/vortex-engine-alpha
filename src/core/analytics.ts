@@ -2,7 +2,7 @@ import { pool } from './db/index.js';
 import { addDaysIst, todayIst } from './time.js';
 
 export interface AnalyticsRange {
-  type: 'LAST_15_DAYS' | 'MONTH';
+  type: 'LAST_15_DAYS' | 'MONTH' | 'DATE';
   label: string;
   start: string;
   endExclusive: string;
@@ -43,7 +43,23 @@ function monthEndExclusive(month: string) {
   return `${nextYear}-${String(nextMonth).padStart(2, '0')}-01`;
 }
 
-export function resolveAnalyticsRange(month?: string): AnalyticsRange {
+export function resolveAnalyticsRange(options?: {
+  month?: string;
+  date?: string;
+}): AnalyticsRange {
+  const { month, date } = options ?? {};
+  if (date) {
+    const endDate = addDaysIst(date, 1);
+    return {
+      type: 'DATE',
+      label: date,
+      start: new Date(`${date}T00:00:00+05:30`).toISOString(),
+      endExclusive: new Date(`${endDate}T00:00:00+05:30`).toISOString(),
+      days: 1,
+      timezone: 'Asia/Kolkata'
+    };
+  }
+
   if (month) {
     const startDate = `${month}-01`;
     const endDate = monthEndExclusive(month);
