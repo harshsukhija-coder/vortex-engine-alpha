@@ -1807,6 +1807,236 @@ const extendBookingSchema = z.object({
   upiAmount: z.number().nonnegative().optional()
 });
 
+const extensionPreviewQuerySchema = z.object({
+  extensionMinutes: z.coerce
+    .number()
+    .int()
+    .min(15, "extensionMinutes must be at least 15")
+    .max(720, "extensionMinutes cannot exceed 720")
+});
+
+// GET /api/setup-instances/:id/extension-preview - Preview an extension without changing the session
+api.get(
+  '/setup-instances/:id/extension-preview',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  async (c) => {
+    try {
+      const setupInstanceId = Number(c.req.param('id'));
+      if (!Number.isInteger(setupInstanceId) || setupInstanceId <= 0) {
+        return c.json({ success: false, error: "Invalid setup instance ID" }, 400);
+      }
+
+      const validated = extensionPreviewQuerySchema.safeParse(c.req.query());
+      if (!validated.success) {
+        return c.json(
+          {
+            success: false,
+            error: "Invalid query parameters",
+            details: validated.error.format()
+          },
+          400
+        );
+      }
+      const { extensionMinutes } = validated.data;
+
+      const [booking] = await db
+        .select()
+        .from(bookingTable)
+        .where(
+          and(
+            eq(bookingTable.setupId, setupInstanceId),
+            eq(bookingTable.status, 'CONFIRMED'),
+            isNull(bookingTable.actualEndTime)
+          )
+        )
+        .orderBy(desc(bookingTable.createdAt))
+        .limit(1);
+      if (!booking) {
+        return c.json(
+          { success: false, error: "No active confirmed session found on this instance" },
+          404
+        );
+      }
+
+      const snapshot = (booking.setupSnapshot as Record<string, any> | null) ?? {};
+      const playersCount = booking.count || 1;
+      const isSinglePlayer = playersCount === 1;
+      const singlePlayerPrice = Number(
+        snapshot.singlePlayerPrice ?? snapshot.chargePerPersonPerHour ?? snapshot.price ?? 150
+      );
+      const multiplayerPrice = Number(
+        snapshot.multiplayerPrice ?? snapshot.chargePerPersonPerHour ?? snapshot.price ?? 120
+      );
+      const ratePerPersonPerHour = isSinglePlayer
+        ? singlePlayerPrice
+        : multiplayerPrice;
+
+      const currentStartTime = new Date(booking.actualStartTime ?? booking.startTime);
+      const currentEndTime = new Date(booking.endTime);
+      const extensionHours = extensionMinutes / 60;
+      const currentDurationHours = Math.max(
+        0.25,
+        (currentEndTime.getTime() - currentStartTime.getTime()) / 3_600_000
+      );
+      const totalDurationHours = currentDurationHours + extensionHours;
+      const newEndTime = new Date(
+        currentEndTime.getTime() + extensionMinutes * 60_000
+      );
+
+      const [setupInstance, customer, games, overlappingBooking, overlappingLock] =
+        await Promise.all([
+          db
+            .select()
+            .from(setupsTable)
+            .where(eq(setupsTable.id, setupInstanceId))
+            .then((rows) => rows[0]),
+          db
+            .select()
+            .from(customersTable)
+            .where(eq(customersTable.phoneNumber, booking.phoneNumber))
+            .then((rows) => rows[0]),
+          db
+            .select({ id: gamesTable.id, name: gamesTable.name })
+            .from(bookingAndGames)
+            .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+            .where(eq(bookingAndGames.bookingId, booking.id)),
+          db
+            .select({ id: bookingTable.id })
+            .from(bookingTable)
+            .where(
+              and(
+                eq(bookingTable.setupId, setupInstanceId),
+                lt(bookingTable.startTime, newEndTime),
+                gt(bookingTable.endTime, currentEndTime),
+                ne(bookingTable.status, 'CANCELLED'),
+                ne(bookingTable.id, booking.id)
+              )
+            )
+            .then((rows) => rows[0]),
+          db
+            .select({ id: slotLocksTable.id })
+            .from(slotLocksTable)
+            .where(
+              and(
+                eq(slotLocksTable.setupId, setupInstanceId),
+                lt(slotLocksTable.startTime, newEndTime),
+                gt(slotLocksTable.endTime, currentEndTime),
+                gt(slotLocksTable.lockedUntil, new Date())
+              )
+            )
+            .then((rows) => rows[0])
+        ]);
+
+      if (!setupInstance) {
+        return c.json({ success: false, error: "Setup instance not found" }, 404);
+      }
+
+      const offerEvaluation = evaluatePromotions({
+        setup: {
+          id: Number(snapshot.setupConfigurationId ?? setupInstance.setupConfigurationId),
+          name: String(snapshot.name ?? setupInstance.name),
+          consoleType: String(snapshot.consoleType ?? 'Console'),
+          price: Number(snapshot.price ?? ratePerPersonPerHour),
+          singlePlayerPrice,
+          multiplayerPrice
+        },
+        playersCount,
+        dateStr: currentStartTime.toLocaleDateString('en-CA', {
+          timeZone: 'Asia/Kolkata'
+        }),
+        startTimeStr: currentStartTime.toLocaleTimeString('en-US', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true,
+          timeZone: 'Asia/Kolkata'
+        }),
+        durationHours: totalDurationHours
+      });
+
+      const previousTotalAmount = booking.amountCharged ?? 0;
+      const additionalAmountToPay = Math.max(
+        0,
+        offerEvaluation.totalAmount - previousTotalAmount
+      );
+      const conflict = overlappingBooking
+        ? {
+          type: "BOOKING",
+          message: `Extension overlaps booking #${overlappingBooking.id}`
+        }
+        : overlappingLock
+          ? {
+            type: "LOCK",
+            message: "Extension overlaps an active temporary lock"
+          }
+          : null;
+
+      return c.json({
+        success: true,
+        canExtend: conflict === null,
+        conflict,
+        session: {
+          bookingId: booking.id,
+          status: booking.status,
+          setup: {
+            instanceId: setupInstance.id,
+            instanceName: setupInstance.name,
+            configurationName: String(snapshot.name ?? "Configuration"),
+            consoleType: String(snapshot.consoleType ?? "Console")
+          },
+          customer: {
+            name: customer?.name ?? "Customer",
+            phoneNumber: booking.phoneNumber,
+            dateOfBirth: customer?.dateOfBirth ?? null
+          },
+          playersCount,
+          games,
+          currentTiming: {
+            startTime: currentStartTime,
+            endTime: currentEndTime,
+            durationHours: currentDurationHours
+          },
+          currentPricing: {
+            originalAmount: booking.originalAmount ?? 0,
+            totalAmount: previousTotalAmount,
+            cashAmount: booking.cashAmount ?? 0,
+            upiAmount: booking.upiAmount ?? 0
+          }
+        },
+        extensionPreview: {
+          extensionMinutes,
+          extensionHours,
+          previousEndTime: currentEndTime,
+          newEndTime,
+          totalDurationHours,
+          pricing: {
+            ratePerPersonPerHour,
+            originalAmount: offerEvaluation.originalAmount,
+            discountApplied: offerEvaluation.discountApplied,
+            totalAmount: offerEvaluation.totalAmount,
+            previousTotalAmount,
+            additionalAmountToPay
+          },
+          appliedOffers: offerEvaluation.appliedOffers,
+          applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
+          ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible)
+        }
+      });
+    } catch (error: unknown) {
+      console.error(error);
+      return c.json(
+        {
+          success: false,
+          error: error instanceof Error
+            ? error.message
+            : "Failed to preview session extension"
+        },
+        500
+      );
+    }
+  }
+);
+
 // 5d. POST /api/bookings/:id/extend - Extend an existing booking, recalculate pricing & offers (Restricted to Admin/Super Admin)
 api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), async (c) => {
   try {
@@ -1861,13 +2091,8 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
 
     // 2. Pricing & Offers Calculation for total extended session
     const newOriginalAmount = Math.ceil(totalDurationHours * ratePerPersonPerHour * count);
-    const existingBookingOffers = await db
-      .select({ offerId: bookingAndOffersTable.offerId })
-      .from(bookingAndOffersTable)
-      .where(eq(bookingAndOffersTable.bookingId, id));
     const targetOfferIds = data.offers?.appliedOfferIds
-      ?? data.appliedOfferIds
-      ?? existingBookingOffers.map((offer) => offer.offerId);
+      ?? data.appliedOfferIds;
     const offerEvaluation = evaluatePromotions({
       setup: {
         id: Number(snapshot.setupConfigurationId ?? setupId),
@@ -1886,7 +2111,9 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
         timeZone: 'Asia/Kolkata'
       }),
       durationHours: totalDurationHours,
-      selectedOfferIds: targetOfferIds.length > 0 ? targetOfferIds : undefined
+      selectedOfferIds: targetOfferIds && targetOfferIds.length > 0
+        ? targetOfferIds
+        : undefined
     });
     const appliedOffers = offerEvaluation.appliedOffers;
     const discountApplied = offerEvaluation.discountApplied;
