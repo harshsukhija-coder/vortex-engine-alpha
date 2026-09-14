@@ -139,9 +139,9 @@ async function seed() {
       description: 'Featuring a big 65" screen setup equipped with PS5 consoles, comfortable chairs, high-end controllers, and immersive sound.',
       consoleType: 'PS5',
       screenType: '65 inch Sansui',
-      price: 150,
-      singlePlayerPrice: 150,
-      multiplayerPrice: 120,
+      price: 120,
+      singlePlayerPrice: 120,
+      multiplayerPrice: 100,
       isActive: true,
       extendedConfigurations: {
         headphones: 'Sony WH-CH520 Wireless',

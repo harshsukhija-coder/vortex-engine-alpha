@@ -1,5 +1,11 @@
 import { sql } from "drizzle-orm";
-import { boolean, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
+import { boolean, customType, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
+
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return "bytea";
+  }
+});
 
 // Games
 export const gamesTable = pgTable("games", {
@@ -211,3 +217,32 @@ export const customersTable = pgTable("customers", {
   createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
 });
+
+// One opening electricity meter reading per IST calendar day
+export const dailyMeterReadingsTable = pgTable("daily_meter_readings", {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  readingDate: varchar("reading_date", { length: 10 }).notNull().unique(),
+  meterReading: doublePrecision("meter_reading").notNull(),
+  imageData: bytea("image_data").notNull(),
+  imageMimeType: varchar("image_mime_type", { length: 100 }).notNull(),
+  imageFileName: varchar("image_file_name", { length: 255 }).notNull(),
+  imageSize: integer("image_size").notNull(),
+  submittedBy: integer("submitted_by").references(() => usersTable.id, {
+    onDelete: "set null"
+  }),
+  updatedBy: integer("updated_by").references(() => usersTable.id, {
+    onDelete: "set null"
+  }),
+  createdAt: timestamp("created_at", {
+    precision: 6,
+    withTimezone: true
+  }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", {
+    precision: 6,
+    withTimezone: true
+  }).notNull().defaultNow()
+}, (table) => ({
+  submittedByIdx: index("daily_meter_readings_submitted_by_idx").on(
+    table.submittedBy
+  )
+}));

@@ -96,13 +96,17 @@ WITH filtered_sessions AS MATERIALIZED (
     booking.*,
     COALESCE(booking.actual_start_time, booking.start_time) AS effective_start,
     COALESCE(booking.actual_end_time, booking.end_time) AS effective_end,
-    GREATEST(
-      0,
-      EXTRACT(EPOCH FROM (
-        COALESCE(booking.actual_end_time, booking.end_time)
-        - COALESCE(booking.actual_start_time, booking.start_time)
-      )) / 3600.0
-    ) AS duration_hours
+    (
+      FLOOR(
+        GREATEST(
+          0,
+          EXTRACT(EPOCH FROM (
+            COALESCE(booking.actual_end_time, booking.end_time)
+            - COALESCE(booking.actual_start_time, booking.start_time)
+          )) / 60.0
+        ) / 15
+      ) * 15
+    ) / 60.0 AS duration_hours
   FROM booking_tables AS booking
   WHERE booking.status <> 'CANCELLED'
     AND COALESCE(booking.actual_start_time, booking.start_time) >= $1
@@ -319,7 +323,7 @@ SELECT
     ) AS daily_rows
   ), '[]'::jsonb) AS "dailyTrend",
   COALESCE((
-    SELECT jsonb_agg(hour_stats ORDER BY (hour_stats->>'sessions')::integer DESC)
+    SELECT jsonb_agg(hour_stats ORDER BY (hour_stats->>'hour')::integer ASC)
     FROM (
       SELECT jsonb_build_object(
         'hour', EXTRACT(HOUR FROM effective_start AT TIME ZONE 'Asia/Kolkata')::integer,
@@ -362,7 +366,7 @@ SELECT
       'unattributedAdditionalPlayerVisits', COALESCE(SUM(GREATEST(count - 1, 0)), 0)::integer,
       'ageGroupMethod', 'Age groups count identifiable primary booking customers only. Additional players are not linked to bookings in the current schema.',
       'revenueMethod', 'Revenue uses the full final booking amount for sessions whose effective start is inside the selected range.',
-      'durationMethod', 'Duration uses actual session timestamps when present, otherwise scheduled timestamps.'
+      'durationMethod', 'Duration uses actual session timestamps when present, otherwise scheduled timestamps, then floors elapsed time to completed 15-minute blocks.'
     )
     FROM customer_sessions
   ) AS "dataQuality"

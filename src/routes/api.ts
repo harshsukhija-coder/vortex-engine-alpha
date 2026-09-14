@@ -3318,6 +3318,34 @@ api.get('/setup-instances/occupancy', authMiddleware, requireRole(['ADMIN', 'SUP
         )
       );
 
+    const currentBookingIds = currentBookings.map((booking) => booking.id);
+    const currentCustomerPhones = [
+      ...new Set(currentBookings.map((booking) => booking.phoneNumber))
+    ];
+    const [currentCustomers, currentBookingGames] = await Promise.all([
+      currentCustomerPhones.length > 0
+        ? db
+          .select({
+            name: customersTable.name,
+            phoneNumber: customersTable.phoneNumber,
+            dateOfBirth: customersTable.dateOfBirth
+          })
+          .from(customersTable)
+          .where(inArray(customersTable.phoneNumber, currentCustomerPhones))
+        : Promise.resolve([]),
+      currentBookingIds.length > 0
+        ? db
+          .select({
+            bookingId: bookingAndGames.bookingId,
+            id: gamesTable.id,
+            name: gamesTable.name
+          })
+          .from(bookingAndGames)
+          .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+          .where(inArray(bookingAndGames.bookingId, currentBookingIds))
+        : Promise.resolve([])
+    ]);
+
     const occupancy = setups.map((setup) => {
       const config = configs.find((cfg) => cfg.id === setup.setupConfigurationId);
       const activeBooking = currentBookings.find((b) => b.setupId === setup.id);
@@ -3342,6 +3370,17 @@ api.get('/setup-instances/occupancy', authMiddleware, requireRole(['ADMIN', 'SUP
       }
 
       const bookedByUser = activeBooking?.bookedBy ? users.find(u => u.id === activeBooking.bookedBy) : null;
+      const customer = activeBooking
+        ? currentCustomers.find(
+          (currentCustomer) =>
+            currentCustomer.phoneNumber === activeBooking.phoneNumber
+        )
+        : null;
+      const selectedGames = activeBooking
+        ? currentBookingGames
+          .filter((game) => game.bookingId === activeBooking.id)
+          .map(({ id, name }) => ({ id, name }))
+        : [];
 
       return {
         instanceId: setup.id,
@@ -3364,6 +3403,15 @@ api.get('/setup-instances/occupancy', authMiddleware, requireRole(['ADMIN', 'SUP
         currentBooking: activeBooking ? {
           bookingId: activeBooking.id,
           phoneNumber: activeBooking.phoneNumber,
+          customerName: customer?.name ?? null,
+          customer: customer
+            ? {
+              name: customer.name,
+              phoneNumber: customer.phoneNumber,
+              dateOfBirth: customer.dateOfBirth
+            }
+            : null,
+          games: selectedGames,
           playersCount: activeBooking.count,
           status: activeBooking.status,
           startTime: activeBooking.startTime,
