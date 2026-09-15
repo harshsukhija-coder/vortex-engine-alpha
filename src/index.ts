@@ -5,6 +5,7 @@ import { cors } from 'hono/cors'
 import env from './core/env.js'
 
 import api from './routes/api.js'
+import addOns from './routes/add-ons.js'
 import analytics from './routes/analytics.js'
 import auth from './routes/auth.js'
 import meterReadings from './routes/meter-readings.js'
@@ -15,6 +16,7 @@ export const app = new Hono()
   .use('/api/*', cors())
 
 app.route('/api', api)
+app.route('/api', addOns)
 app.route('/api', analytics)
 app.route('/api', auth)
 app.route('/api', meterReadings)

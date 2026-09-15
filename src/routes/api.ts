@@ -9,9 +9,11 @@ import {
   bookingTable,
   bookingAndGames,
   bookingAndOffersTable,
+  bookingAddOnsTable,
   slotLocksTable,
   bookingSlotsTable,
   tentativeBookingTable,
+  tentativeBookingAddOnsTable,
   customersTable,
   usersTable
 } from '../core/db/schema.js';
@@ -21,6 +23,11 @@ import { authMiddleware, requireRole } from '../middlewares/auth.js';
 import { verify } from 'hono/jwt';
 import env from '../core/env.js';
 import { calculatePriceForRule } from '../core/pricing.js';
+import {
+  getBookingAddOnSummary,
+  resolveAddOnLines
+} from '../core/add-ons.js';
+import { floorBillableMinutes } from '../core/billing-duration.js';
 
 const api = new Hono();
 
@@ -99,6 +106,11 @@ function parseTimeToDate(dateStr: string, timeStr: string): Date {
   return new Date(`${kolkataStr}+05:30`);
 }
 
+const addOnSelectionSchema = z.object({
+  addOnId: z.number().int().positive(),
+  units: z.number().int().positive()
+});
+
 // Shared booking fields. Actual and tentative bookings intentionally use different setup identifiers.
 const bookingPayloadSchema = z.object({
   setupName: z.string().optional(),
@@ -121,7 +133,8 @@ const bookingPayloadSchema = z.object({
     endTime: z.string().optional(),
     noOfHours: z.number().positive().optional(),
     gameIds: z.array(z.number().int().positive()).optional(),
-    games: z.array(z.object({ id: z.number().int().positive(), name: z.string().optional() })).optional()
+    games: z.array(z.object({ id: z.number().int().positive(), name: z.string().optional() })).optional(),
+    addOns: z.array(addOnSelectionSchema).optional()
   }).optional(),
   pricing: z.object({
     basePrice: z.number().optional(),
@@ -152,6 +165,7 @@ const bookingPayloadSchema = z.object({
   noOfHours: z.number().positive().optional(),
   gameIds: z.array(z.number().int().positive()).optional(),
   appliedOfferIds: z.array(z.number().int().positive()).optional(),
+  addOns: z.array(addOnSelectionSchema).optional(),
   cashAmount: z.number().nonnegative().optional(),
   upiAmount: z.number().nonnegative().optional()
 });
@@ -343,7 +357,8 @@ const actualReviewSchema = z.object({
     endTime: z.string().optional(),
     noOfHours: z.number().positive().optional(),
     gameIds: z.array(z.number().int().positive()).optional(),
-    games: z.array(z.object({ id: z.number().int().positive(), name: z.string().optional() })).optional()
+    games: z.array(z.object({ id: z.number().int().positive(), name: z.string().optional() })).optional(),
+    addOns: z.array(addOnSelectionSchema).optional()
   }).optional(),
   count: z.number().int().positive().optional(),
   playersCount: z.number().int().positive().optional(),
@@ -351,7 +366,8 @@ const actualReviewSchema = z.object({
   startTime: z.string().optional(),
   noOfHours: z.number().positive().optional(),
   gameIds: z.array(z.number().int().positive()).optional(),
-  appliedOfferIds: z.array(z.number().int().positive()).optional()
+  appliedOfferIds: z.array(z.number().int().positive()).optional(),
+  addOns: z.array(addOnSelectionSchema).optional()
 });
 
 const bookingReviewSchema = actualReviewSchema
@@ -694,6 +710,9 @@ api.post('/bookings/review', async (c) => {
     const noOfHours = bDetails.noOfHours ?? data.noOfHours ?? 1;
     const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
     const appliedOfferIds = data.appliedOfferIds ?? [];
+    const addOnSelection = await resolveAddOnLines(
+      bDetails.addOns ?? data.addOns ?? []
+    );
 
     const setupInstance = data.setupInstanceId === undefined
       ? undefined
@@ -767,6 +786,8 @@ api.post('/bookings/review', async (c) => {
         playersCount: count,
         durationHours: noOfHours,
         games: selectedGames,
+        addOns: addOnSelection.lines,
+        addOnsTotal: addOnSelection.total,
         selectedOffers
       }
     });
@@ -888,7 +909,9 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
 
     const pricing = calculatePriceForRule(config, count, durationHours);
     const ratePerPersonPerHour = pricing.ratePerPersonPerHour;
-    const originalAmount = pricing.basePrice;
+    const addOnSelection = await resolveAddOnLines(
+      bDetails.addOns ?? data.addOns ?? []
+    );
     const selectedOfferIds = data.appliedOfferIds
       ?? data.offers?.appliedOfferIds
       ?? data.offers?.appliedOffers?.flatMap((offer) => offer.id ? [offer.id] : []);
@@ -908,7 +931,8 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
       selectedOfferIds
     });
     const discountApplied = offerEvaluation.discountApplied;
-    const amountCharged = offerEvaluation.totalAmount;
+    const originalAmount = pricing.basePrice + addOnSelection.total;
+    const amountCharged = offerEvaluation.totalAmount + addOnSelection.total;
     const appliedOffers = offerEvaluation.appliedOffers;
 
     // Payment amounts
@@ -1037,6 +1061,23 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           .values({ bookingId: insertedBooking.id, offerId: offer.id });
       }
 
+      if (addOnSelection.lines.length > 0) {
+        await tx.insert(bookingAddOnsTable).values(
+          addOnSelection.lines.map((line) => ({
+            bookingId: insertedBooking.id,
+            addOnId: line.addOnId,
+            itemName: line.itemName,
+            unitPrice: line.unitPrice,
+            itemQuantity: line.itemQuantity,
+            quantityUnit: line.quantityUnit,
+            imageUrl: line.imageUrl,
+            units: line.units,
+            lineTotal: line.lineTotal,
+            addedBy: adminId ?? null
+          }))
+        );
+      }
+
       await tx
         .update(setupsTable)
         .set({
@@ -1100,12 +1141,16 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           ratePerPersonPerHour,
           playerType: pricing.playerType,
           calculationFormula: pricing.calculationFormula,
+          gameplayOriginalAmount: pricing.basePrice,
+          gameplayTotalAmount: offerEvaluation.totalAmount,
+          addOnsTotal: addOnSelection.total,
           originalAmount,
           discountApplied,
           totalAmount: amountCharged,
           cashAmount: booking.cashAmount,
           upiAmount: booking.upiAmount
         },
+        addOns: addOnSelection.lines,
         appliedOffers,
         applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
         ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible),
@@ -1186,7 +1231,9 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
     const durationHours = noOfHours;
 
     // 2. Calculate Base Pricing
-    const originalAmount = pricing.basePrice;
+    const addOnSelection = await resolveAddOnLines(
+      bDetails.addOns ?? data.addOns ?? []
+    );
 
     const offerEvaluation = evaluatePromotions({
       setup: {
@@ -1203,7 +1250,8 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
       durationHours,
       selectedOfferIds: appliedOfferIds
     });
-    const amountCharged = offerEvaluation.totalAmount;
+    const originalAmount = pricing.basePrice + addOnSelection.total;
+    const amountCharged = offerEvaluation.totalAmount + addOnSelection.total;
     const appliedOffers = offerEvaluation.appliedOffers;
 
     // 4. Build setup snapshot
@@ -1221,25 +1269,46 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
       snapshotAt: new Date().toISOString()
     };
 
-    const [tentativeBooking] = await db
-      .insert(tentativeBookingTable)
-      .values({
-        phoneNumber,
-        setupConfigurationId,
-        userId: userId || adminId || null,
-        bookedBy: adminId || null,
-        count,
-        originalAmount,
-        amountCharged,
-        startTime: minStart,
-        endTime: maxEnd,
-        requestedStartTime: minStart,
-        requestedNoOfHours: noOfHours,
-        setupSnapshot,
-        gameIds: gameIds || [],
-        appliedOfferIds: appliedOffers.map((offer) => offer.id)
-      })
-      .returning();
+    const tentativeBooking = await db.transaction(async (tx) => {
+      const [inserted] = await tx
+        .insert(tentativeBookingTable)
+        .values({
+          phoneNumber,
+          setupConfigurationId,
+          userId: userId || adminId || null,
+          bookedBy: adminId || null,
+          count,
+          originalAmount,
+          amountCharged,
+          startTime: minStart,
+          endTime: maxEnd,
+          requestedStartTime: minStart,
+          requestedNoOfHours: noOfHours,
+          setupSnapshot,
+          gameIds: gameIds || [],
+          appliedOfferIds: appliedOffers.map((offer) => offer.id)
+        })
+        .returning();
+
+      if (addOnSelection.lines.length > 0) {
+        await tx.insert(tentativeBookingAddOnsTable).values(
+          addOnSelection.lines.map((line) => ({
+            tentativeBookingId: inserted.id,
+            addOnId: line.addOnId,
+            itemName: line.itemName,
+            unitPrice: line.unitPrice,
+            itemQuantity: line.itemQuantity,
+            quantityUnit: line.quantityUnit,
+            imageUrl: line.imageUrl,
+            units: line.units,
+            lineTotal: line.lineTotal,
+            addedBy: adminId ?? null
+          }))
+        );
+      }
+
+      return inserted;
+    });
 
     return c.json({
       success: true,
@@ -1255,10 +1324,14 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
           ratePerPersonPerHour: pricing.ratePerPersonPerHour,
           playerType: pricing.playerType,
           calculationFormula: pricing.calculationFormula,
+          gameplayOriginalAmount: pricing.basePrice,
+          gameplayTotalAmount: offerEvaluation.totalAmount,
+          addOnsTotal: addOnSelection.total,
           originalAmount,
           discountApplied: offerEvaluation.discountApplied,
           totalAmount: amountCharged
-        }
+        },
+        addOns: addOnSelection.lines
       }
     });
   } catch (error: any) {
@@ -1307,10 +1380,25 @@ api.get('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMI
         .from(setupConfigurationsTable)
         .where(inArray(setupConfigurationsTable.id, configurationIds))
       : [];
+    const tentativeBookingIds = bookings.map((booking) => booking.id);
+    const tentativeAddOns = tentativeBookingIds.length > 0
+      ? await db
+        .select()
+        .from(tentativeBookingAddOnsTable)
+        .where(
+          inArray(
+            tentativeBookingAddOnsTable.tentativeBookingId,
+            tentativeBookingIds
+          )
+        )
+      : [];
 
     return c.json({
       success: true,
       bookings: bookings.map((booking) => {
+        const bookingAddOns = tentativeAddOns.filter(
+          (line) => line.tentativeBookingId === booking.id
+        );
         const snapshot = booking.setupSnapshot as {
           name?: string;
           consoleType?: string;
@@ -1347,6 +1435,11 @@ api.get('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMI
           setupConfiguration: configurations.find(
             (configuration) => configuration.id === booking.setupConfigurationId
           ) ?? null,
+          addOns: bookingAddOns,
+          addOnsTotal: bookingAddOns.reduce(
+            (sum, line) => sum + line.lineTotal,
+            0
+          ),
           appliedOffers: offerEvaluation.appliedOffers,
           applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
           ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible),
@@ -1403,6 +1496,12 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
       if (!tentative) {
         throw new Error("Tentative booking not found");
       }
+      const tentativeAddOns = await tx
+        .select()
+        .from(tentativeBookingAddOnsTable)
+        .where(
+          eq(tentativeBookingAddOnsTable.tentativeBookingId, tentative.id)
+        );
 
       await tx.execute(sql`select pg_advisory_xact_lock(${tentative.setupConfigurationId})`);
 
@@ -1547,7 +1646,25 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
         }
       }
 
-      // 7. Delete tentative booking
+      // 7. Move add-on snapshots to the confirmed booking
+      if (tentativeAddOns.length > 0) {
+        await tx.insert(bookingAddOnsTable).values(
+          tentativeAddOns.map((line) => ({
+            bookingId: booking.id,
+            addOnId: line.addOnId,
+            itemName: line.itemName,
+            unitPrice: line.unitPrice,
+            itemQuantity: line.itemQuantity,
+            quantityUnit: line.quantityUnit,
+            imageUrl: line.imageUrl,
+            units: line.units,
+            lineTotal: line.lineTotal,
+            addedBy: line.addedBy
+          }))
+        );
+      }
+
+      // 8. Delete tentative booking
       await tx
         .delete(tentativeBookingTable)
         .where(eq(tentativeBookingTable.id, id));
@@ -1563,6 +1680,7 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
       return booking;
     });
 
+    const addOnSummary = await getBookingAddOnSummary(result.id);
     return c.json({
       success: true,
       message: "Tentative booking successfully confirmed.",
@@ -1581,7 +1699,9 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
           totalAmount: result.amountCharged,
           cashAmount: result.cashAmount,
           upiAmount: result.upiAmount
-        }
+        },
+        addOns: addOnSummary.items,
+        addOnsTotal: addOnSummary.total
       }
     });
   } catch (error: any) {
@@ -1858,6 +1978,7 @@ api.get(
           404
         );
       }
+      const addOnSummary = await getBookingAddOnSummary(booking.id);
 
       const snapshot = (booking.setupSnapshot as Record<string, any> | null) ?? {};
       const playersCount = booking.count || 1;
@@ -1955,9 +2076,11 @@ api.get(
       });
 
       const previousTotalAmount = booking.amountCharged ?? 0;
+      const extendedTotalAmount =
+        offerEvaluation.totalAmount + addOnSummary.total;
       const additionalAmountToPay = Math.max(
         0,
-        offerEvaluation.totalAmount - previousTotalAmount
+        extendedTotalAmount - previousTotalAmount
       );
       const conflict = overlappingBooking
         ? {
@@ -1999,9 +2122,11 @@ api.get(
           currentPricing: {
             originalAmount: booking.originalAmount ?? 0,
             totalAmount: previousTotalAmount,
+            addOnsTotal: addOnSummary.total,
             cashAmount: booking.cashAmount ?? 0,
             upiAmount: booking.upiAmount ?? 0
-          }
+          },
+          addOns: addOnSummary.items
         },
         extensionPreview: {
           extensionMinutes,
@@ -2011,9 +2136,13 @@ api.get(
           totalDurationHours,
           pricing: {
             ratePerPersonPerHour,
-            originalAmount: offerEvaluation.originalAmount,
+            gameplayOriginalAmount: offerEvaluation.originalAmount,
+            gameplayTotalAmount: offerEvaluation.totalAmount,
+            addOnsTotal: addOnSummary.total,
+            originalAmount:
+              offerEvaluation.originalAmount + addOnSummary.total,
             discountApplied: offerEvaluation.discountApplied,
-            totalAmount: offerEvaluation.totalAmount,
+            totalAmount: extendedTotalAmount,
             previousTotalAmount,
             additionalAmountToPay
           },
@@ -2064,6 +2193,7 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
     if (!booking) {
       return c.json({ success: false, error: "Booking not found" }, 404);
     }
+    const addOnSummary = await getBookingAddOnSummary(booking.id);
 
     if (booking.status === 'CANCELLED') {
       return c.json({ success: false, error: "Cannot extend a cancelled booking" }, 400);
@@ -2090,7 +2220,10 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
     const newEndTime = new Date(currentEndTime.getTime() + extensionMinutes * 60 * 1000);
 
     // 2. Pricing & Offers Calculation for total extended session
-    const newOriginalAmount = Math.ceil(totalDurationHours * ratePerPersonPerHour * count);
+    const newGameplayOriginalAmount = Math.ceil(
+      totalDurationHours * ratePerPersonPerHour * count
+    );
+    const newOriginalAmount = newGameplayOriginalAmount + addOnSummary.total;
     const targetOfferIds = data.offers?.appliedOfferIds
       ?? data.appliedOfferIds;
     const offerEvaluation = evaluatePromotions({
@@ -2117,7 +2250,7 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
     });
     const appliedOffers = offerEvaluation.appliedOffers;
     const discountApplied = offerEvaluation.discountApplied;
-    const newTotalAmount = offerEvaluation.totalAmount;
+    const newTotalAmount = offerEvaluation.totalAmount + addOnSummary.total;
     const previousTotalAmount = booking.amountCharged || 0;
     const additionalAmountToPay = Math.max(0, newTotalAmount - previousTotalAmount);
 
@@ -2230,12 +2363,16 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
         playerType: isSingle ? "SINGLE_PLAYER" : "MULTIPLAYER",
         previousOriginalAmount: booking.originalAmount,
         previousTotalAmount,
+        newGameplayOriginalAmount,
+        newGameplayTotalAmount: offerEvaluation.totalAmount,
+        addOnsTotal: addOnSummary.total,
         newOriginalAmount,
         discountApplied,
         newTotalAmount,
         additionalAmountToPay
       },
       appliedOffers,
+      addOns: addOnSummary.items,
       booking: updated
     });
   } catch (error: any) {
@@ -2348,20 +2485,25 @@ async function handleEndSessionLogic(params: {
     throw new Error("Actual end time cannot be in the future");
   }
 
-  // Calculate elapsed time (minimum 15 mins, rounded up to nearest 15 mins)
+  // Floor each hour's remainder into 0, 15, or 30 billable minutes.
   const elapsedMs = Math.max(0, actualEndTime.getTime() - actualStartTime.getTime());
-  const elapsedMinutes = Math.max(1, Math.ceil(elapsedMs / (1000 * 60)));
-  const roundedMinutes = Math.max(15, Math.ceil(elapsedMinutes / 15) * 15);
+  const elapsedMinutes = Math.floor(elapsedMs / (1000 * 60));
+  const roundedMinutes = floorBillableMinutes(elapsedMs);
   const actualDurationHours = roundedMinutes / 60;
   const scheduledDurationHours = booking.requestedNoOfHours || Math.round((new Date(booking.endTime).getTime() - actualStartTime.getTime()) / (1000 * 60 * 60) * 100) / 100;
 
-  // Recalculate original base amount for actual duration
-  const finalOriginalAmount = Math.ceil(actualDurationHours * ratePerPersonPerHour * count);
+  // Recalculate gameplay amount for actual duration. Add-ons are never discounted.
+  const finalGameplayOriginalAmount = Math.ceil(
+    actualDurationHours * ratePerPersonPerHour * count
+  );
 
-  const existingBookingOffers = await db
-    .select({ offerId: bookingAndOffersTable.offerId })
-    .from(bookingAndOffersTable)
-    .where(eq(bookingAndOffersTable.bookingId, booking.id));
+  const [existingBookingOffers, addOnSummary] = await Promise.all([
+    db
+      .select({ offerId: bookingAndOffersTable.offerId })
+      .from(bookingAndOffersTable)
+      .where(eq(bookingAndOffersTable.bookingId, booking.id)),
+    getBookingAddOnSummary(booking.id)
+  ]);
   const offerEvaluation = evaluatePromotions({
     setup: {
       id: Number(snapshot.setupConfigurationId ?? booking.setupId ?? 0),
@@ -2386,7 +2528,10 @@ async function handleEndSessionLogic(params: {
   });
 
   const appliedOffers = offerEvaluation.appliedOffers;
-  const calculatedAmountCharged = offerEvaluation.totalAmount;
+  const finalOriginalAmount =
+    finalGameplayOriginalAmount + addOnSummary.total;
+  const calculatedAmountCharged =
+    offerEvaluation.totalAmount + addOnSummary.total;
   const finalAmountCharged =
     requestedFinalAmountCharged ?? calculatedAmountCharged;
   const discountApplied = Math.max(0, finalOriginalAmount - finalAmountCharged);
@@ -2514,9 +2659,16 @@ async function handleEndSessionLogic(params: {
         playerType: isSingle ? "SINGLE_PLAYER" : "MULTIPLAYER"
       },
       gamesPlayed: dbGames,
+      addOns: {
+        items: addOnSummary.items,
+        total: addOnSummary.total
+      },
       billing: {
         ratePerPersonPerHour,
-        calculationFormula: `₹${ratePerPersonPerHour}/player/hr × ${count} player(s) × ${actualDurationHours} hr(s) = ₹${finalOriginalAmount}`,
+        calculationFormula: `Gameplay ₹${finalGameplayOriginalAmount} + add-ons ₹${addOnSummary.total} = ₹${finalOriginalAmount}`,
+        gameplayOriginalAmount: finalGameplayOriginalAmount,
+        gameplayAmountAfterOffers: offerEvaluation.totalAmount,
+        addOnsTotal: addOnSummary.total,
         originalAmount: finalOriginalAmount,
         calculatedAmountCharged,
         amountAdjustedManually: requestedFinalAmountCharged !== undefined,
@@ -2584,6 +2736,176 @@ api.post('/setups/:setupId/terminate', authMiddleware, requireRole(['ADMIN', 'SU
   }
 });
 
+const terminationPreviewQuerySchema = z.object({
+  actualStartTime: z.string().datetime().optional(),
+  actualEndTime: z.string().datetime().optional(),
+  finalAmountCharged: z.coerce.number().int().nonnegative().optional(),
+  cashAmount: z.coerce.number().int().nonnegative().optional(),
+  upiAmount: z.coerce.number().int().nonnegative().optional()
+});
+
+async function calculateTerminationPreview(
+  booking: typeof bookingTable.$inferSelect,
+  input: z.infer<typeof terminationPreviewQuerySchema>
+) {
+  const now = new Date();
+  const actualStartTime = input.actualStartTime
+    ? new Date(input.actualStartTime)
+    : new Date(booking.actualStartTime ?? booking.startTime);
+  const actualEndTime = input.actualEndTime
+    ? new Date(input.actualEndTime)
+    : new Date(now);
+  if (!input.actualEndTime) {
+    actualEndTime.setSeconds(0, 0);
+  }
+  if (actualEndTime <= actualStartTime) {
+    throw new Error("Actual end time must be after the session start time");
+  }
+  if (actualEndTime > now) {
+    throw new Error("Actual end time cannot be in the future");
+  }
+
+  const snapshot = (booking.setupSnapshot as Record<string, unknown> | null) ?? {};
+  const playersCount = booking.count || 1;
+  const singlePlayerPrice = Number(
+    snapshot.singlePlayerPrice
+      ?? snapshot.chargePerPersonPerHour
+      ?? snapshot.price
+      ?? 150
+  );
+  const multiplayerPrice = Number(
+    snapshot.multiplayerPrice
+      ?? snapshot.chargePerPersonPerHour
+      ?? snapshot.price
+      ?? 120
+  );
+  const ratePerPersonPerHour = playersCount === 1
+    ? singlePlayerPrice
+    : multiplayerPrice;
+  const elapsedMs = Math.max(
+    0,
+    actualEndTime.getTime() - actualStartTime.getTime()
+  );
+  const elapsedMinutes = Math.floor(elapsedMs / 60_000);
+  const billedMinutes = floorBillableMinutes(elapsedMs);
+  const billedHours = billedMinutes / 60;
+  const gameplayOriginalAmount = Math.ceil(
+    billedHours * ratePerPersonPerHour * playersCount
+  );
+
+  const [existingBookingOffers, addOnSummary] = await Promise.all([
+    db
+      .select({ offerId: bookingAndOffersTable.offerId })
+      .from(bookingAndOffersTable)
+      .where(eq(bookingAndOffersTable.bookingId, booking.id)),
+    getBookingAddOnSummary(booking.id)
+  ]);
+  const offerEvaluation = evaluatePromotions({
+    setup: {
+      id: Number(snapshot.setupConfigurationId ?? booking.setupId ?? 0),
+      name: String(snapshot.name ?? snapshot.instanceName ?? 'Setup'),
+      consoleType: String(snapshot.consoleType ?? 'Console'),
+      price: Number(snapshot.price ?? ratePerPersonPerHour),
+      singlePlayerPrice,
+      multiplayerPrice
+    },
+    playersCount,
+    dateStr: actualStartTime.toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Kolkata'
+    }),
+    startTimeStr: actualStartTime.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+      timeZone: 'Asia/Kolkata'
+    }),
+    durationHours: billedHours,
+    selectedOfferIds: existingBookingOffers.length > 0
+      ? existingBookingOffers.map((offer) => offer.offerId)
+      : undefined
+  });
+
+  const calculatedAmountCharged =
+    offerEvaluation.totalAmount + addOnSummary.total;
+  const totalPayable =
+    input.finalAmountCharged ?? calculatedAmountCharged;
+  const previousCashAmount = booking.cashAmount ?? 0;
+  const previousUpiAmount = booking.upiAmount ?? 0;
+  const previousPaymentRecorded = previousCashAmount + previousUpiAmount;
+  const hasPaymentOverride =
+    input.cashAmount !== undefined || input.upiAmount !== undefined;
+  const cashAmount = hasPaymentOverride
+    ? input.cashAmount ?? 0
+    : previousPaymentRecorded > 0
+      ? Math.round(totalPayable * previousCashAmount / previousPaymentRecorded)
+      : totalPayable;
+  const upiAmount = hasPaymentOverride
+    ? input.upiAmount ?? 0
+    : totalPayable - cashAmount;
+  const paymentRecorded = cashAmount + upiAmount;
+  const paymentDue = Math.max(0, totalPayable - paymentRecorded);
+  const refundDue = Math.max(0, paymentRecorded - totalPayable);
+
+  return {
+    setupPricing: {
+      singlePlayerPrice,
+      multiplayerPrice,
+      ratePerPersonPerHour,
+      playerType: playersCount === 1 ? "SINGLE_PLAYER" : "MULTIPLAYER"
+    },
+    timing: {
+      sessionStarted: true,
+      canTerminateAtProposedTime: true,
+      startedAt: actualStartTime.toISOString(),
+      actualStartTime: actualStartTime.toISOString(),
+      proposedEndTime: actualEndTime.toISOString(),
+      elapsedMinutes,
+      billedMinutes,
+      billedHours
+    },
+    gameplay: {
+      initialAmount: Math.max(
+        0,
+        (booking.originalAmount ?? 0) - addOnSummary.total
+      ),
+      originalAmount: gameplayOriginalAmount,
+      discountApplied: offerEvaluation.discountApplied,
+      amountAfterOffers: offerEvaluation.totalAmount
+    },
+    addOns: {
+      items: addOnSummary.items,
+      total: addOnSummary.total
+    },
+    settlement: {
+      initialAmount: booking.amountCharged ?? 0,
+      previousPayment: {
+        cashAmount: previousCashAmount,
+        upiAmount: previousUpiAmount,
+        total: previousPaymentRecorded
+      },
+      calculatedAmountCharged,
+      amountAdjustedManually: input.finalAmountCharged !== undefined,
+      totalPayable,
+      calculationFormula:
+        `Gameplay ₹${offerEvaluation.totalAmount} + add-ons ₹${addOnSummary.total} = ₹${totalPayable}`,
+      cashAmount,
+      upiAmount,
+      paymentRecorded,
+      paymentDue,
+      refundDue,
+      exactBalance: paymentRecorded === totalPayable,
+      status: paymentDue > 0
+        ? "PAYMENT_DUE"
+        : refundDue > 0
+          ? "REFUND_DUE"
+          : "SETTLED"
+    },
+    appliedOffers: offerEvaluation.appliedOffers,
+    applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
+    ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible)
+  };
+}
+
 // GET /api/setup-instances/:id/terminate-session - Load previous session and termination state
 api.get(
   '/setup-instances/:id/terminate-session',
@@ -2594,6 +2916,17 @@ api.get(
       const setupInstanceId = Number(c.req.param('id'));
       if (!Number.isInteger(setupInstanceId) || setupInstanceId <= 0) {
         return c.json({ success: false, error: "Invalid setup instance ID" }, 400);
+      }
+      const parsedQuery = terminationPreviewQuerySchema.safeParse(c.req.query());
+      if (!parsedQuery.success) {
+        return c.json(
+          {
+            success: false,
+            error: "Invalid checkout preview parameters",
+            details: parsedQuery.error.format()
+          },
+          400
+        );
       }
 
       const [setupInstance] = await db
@@ -2617,6 +2950,65 @@ api.get(
         previousSession?.status === 'CONFIRMED' &&
         previousSession.actualEndTime === null &&
         !terminatedSuccessfully;
+      const addOnSummary = previousSession
+        ? await getBookingAddOnSummary(previousSession.id)
+        : { items: [], total: 0 };
+      const [customer, selectedGames] = previousSession
+        ? await Promise.all([
+          db
+            .select({
+              name: customersTable.name,
+              phoneNumber: customersTable.phoneNumber,
+              dateOfBirth: customersTable.dateOfBirth
+            })
+            .from(customersTable)
+            .where(eq(customersTable.phoneNumber, previousSession.phoneNumber))
+            .then((rows) => rows[0] ?? null),
+          db
+            .select({
+              id: gamesTable.id,
+              name: gamesTable.name
+            })
+            .from(bookingAndGames)
+            .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+            .where(eq(bookingAndGames.bookingId, previousSession.id))
+        ])
+        : [null, []];
+      let checkoutPreview = null;
+      let checkoutPreviewError: {
+        code: string;
+        message: string;
+        actualStartTime: string;
+        proposedEndTime: string;
+      } | null = null;
+      if (canTerminate && previousSession) {
+        try {
+          checkoutPreview = await calculateTerminationPreview(
+            previousSession,
+            parsedQuery.data
+          );
+        } catch (error: unknown) {
+          if (
+            error instanceof Error
+            && error.message === "Actual end time must be after the session start time"
+          ) {
+            checkoutPreviewError = {
+              code: "END_TIME_NOT_AFTER_START",
+              message: error.message,
+              actualStartTime: new Date(
+                parsedQuery.data.actualStartTime
+                  ?? previousSession.actualStartTime
+                  ?? previousSession.startTime
+              ).toISOString(),
+              proposedEndTime: new Date(
+                parsedQuery.data.actualEndTime ?? Date.now()
+              ).toISOString()
+            };
+          } else {
+            throw error;
+          }
+        }
+      }
 
       return c.json({
         success: true,
@@ -2630,29 +3022,47 @@ api.get(
         canCreateNewSession: setupInstance.isActive && terminatedSuccessfully,
         requiresTermination: !terminatedSuccessfully,
         canTerminate,
+        canTerminateWithProposedTime:
+          canTerminate && checkoutPreview !== null,
         acceptedAdjustments: {
-          actualStartTime: "ISO-8601 datetime, optional",
-          actualEndTime: "ISO-8601 datetime, optional",
-          finalAmountCharged: "Nonnegative integer, optional",
-          cashAmount: "Nonnegative integer, optional",
-          upiAmount: "Nonnegative integer, optional"
+          actualStartTime: "ISO-8601 query parameter, optional",
+          actualEndTime: "ISO-8601 query parameter, optional; defaults to now",
+          finalAmountCharged: "Nonnegative integer query parameter, optional",
+          cashAmount: "Nonnegative integer query parameter, optional",
+          upiAmount: "Nonnegative integer query parameter, optional"
         },
         previousSession: previousSession
           ? {
             bookingId: previousSession.id,
             status: previousSession.status,
             phoneNumber: previousSession.phoneNumber,
+            customer,
             playersCount: previousSession.count,
+            games: selectedGames,
             scheduledStartTime: previousSession.startTime,
             scheduledEndTime: previousSession.endTime,
+            startedAt:
+              previousSession.actualStartTime ?? previousSession.startTime,
+            startedAtFormatted: new Date(
+              previousSession.actualStartTime ?? previousSession.startTime
+            ).toLocaleTimeString('en-US', {
+              hour: '2-digit',
+              minute: '2-digit',
+              hour12: true,
+              timeZone: 'Asia/Kolkata'
+            }),
             actualStartTime: previousSession.actualStartTime,
             actualEndTime: previousSession.actualEndTime,
             originalAmount: previousSession.originalAmount,
             amountCharged: previousSession.amountCharged,
+            addOns: addOnSummary.items,
+            addOnsTotal: addOnSummary.total,
             createdAt: previousSession.createdAt,
             updatedAt: previousSession.updatedAt
           }
-          : null
+          : null,
+        checkoutPreview,
+        checkoutPreviewError
       });
     } catch (error: unknown) {
       console.error(error);

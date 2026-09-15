@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { boolean, customType, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
+import { boolean, check, customType, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
 
 const bytea = customType<{ data: Buffer; driverData: Buffer }>({
   dataType() {
@@ -107,6 +107,28 @@ export const usersTable = pgTable("users", {
   updatedAt: timestamp("updated_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
 });
 
+// Add-on catalog (food, drinks, accessories, etc.)
+export const addOnsTable = pgTable("add_ons", {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  itemName: varchar("item_name", { length: 255 }).notNull().unique(),
+  price: integer().notNull(),
+  quantity: doublePrecision().notNull(),
+  quantityUnit: varchar("quantity_unit", { length: 50 }).notNull(),
+  imageUrl: text("image_url"),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", {
+    precision: 6,
+    withTimezone: true
+  }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", {
+    precision: 6,
+    withTimezone: true
+  }).notNull().defaultNow()
+}, (table) => ({
+  priceCheck: check("add_ons_price_nonnegative", sql`${table.price} >= 0`),
+  quantityCheck: check("add_ons_quantity_positive", sql`${table.quantity} > 0`)
+}));
+
 // Booking
 export const bookingTable = pgTable('booking_tables', {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),
@@ -166,6 +188,39 @@ export const bookingAndGames = pgTable("booking_games", {
   gameIdIdx: index("booking_games_game_id_idx").on(table.gameId)
 }));
 
+// Immutable add-on line items attached to confirmed bookings
+export const bookingAddOnsTable = pgTable("booking_add_ons", {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  bookingId: integer("booking_id").notNull().references(() => bookingTable.id, {
+    onDelete: "cascade"
+  }),
+  addOnId: integer("add_on_id").references(() => addOnsTable.id, {
+    onDelete: "set null"
+  }),
+  itemName: varchar("item_name", { length: 255 }).notNull(),
+  unitPrice: integer("unit_price").notNull(),
+  itemQuantity: doublePrecision("item_quantity").notNull(),
+  quantityUnit: varchar("quantity_unit", { length: 50 }).notNull(),
+  imageUrl: text("image_url"),
+  units: integer().notNull(),
+  lineTotal: integer("line_total").notNull(),
+  addedBy: integer("added_by").references(() => usersTable.id, {
+    onDelete: "set null"
+  }),
+  createdAt: timestamp("created_at", {
+    precision: 6,
+    withTimezone: true
+  }).notNull().defaultNow()
+}, (table) => ({
+  bookingIdIdx: index("booking_add_ons_booking_id_idx").on(table.bookingId),
+  addOnIdIdx: index("booking_add_ons_add_on_id_idx").on(table.addOnId),
+  unitsCheck: check("booking_add_ons_units_positive", sql`${table.units} > 0`),
+  lineTotalCheck: check(
+    "booking_add_ons_line_total_nonnegative",
+    sql`${table.lineTotal} >= 0`
+  )
+}));
+
 // Slot Locks (PostgreSQL-based temporary locking)
 export const slotLocksTable = pgTable("slot_locks", {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),
@@ -207,6 +262,44 @@ export const tentativeBookingTable = pgTable('tentative_bookings', {
   createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
 });
+
+// Immutable add-on line items selected on tentative bookings
+export const tentativeBookingAddOnsTable = pgTable("tentative_booking_add_ons", {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  tentativeBookingId: integer("tentative_booking_id").notNull().references(
+    () => tentativeBookingTable.id,
+    { onDelete: "cascade" }
+  ),
+  addOnId: integer("add_on_id").references(() => addOnsTable.id, {
+    onDelete: "set null"
+  }),
+  itemName: varchar("item_name", { length: 255 }).notNull(),
+  unitPrice: integer("unit_price").notNull(),
+  itemQuantity: doublePrecision("item_quantity").notNull(),
+  quantityUnit: varchar("quantity_unit", { length: 50 }).notNull(),
+  imageUrl: text("image_url"),
+  units: integer().notNull(),
+  lineTotal: integer("line_total").notNull(),
+  addedBy: integer("added_by").references(() => usersTable.id, {
+    onDelete: "set null"
+  }),
+  createdAt: timestamp("created_at", {
+    precision: 6,
+    withTimezone: true
+  }).notNull().defaultNow()
+}, (table) => ({
+  tentativeBookingIdIdx: index(
+    "tentative_booking_add_ons_tentative_booking_id_idx"
+  ).on(table.tentativeBookingId),
+  unitsCheck: check(
+    "tentative_booking_add_ons_units_positive",
+    sql`${table.units} > 0`
+  ),
+  lineTotalCheck: check(
+    "tentative_booking_add_ons_line_total_nonnegative",
+    sql`${table.lineTotal} >= 0`
+  )
+}));
 
 // Customers (end-user / walk-in customer profiles)
 export const customersTable = pgTable("customers", {

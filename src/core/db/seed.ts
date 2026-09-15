@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { db, pool } from './index.js';
-import { gamesTable, setupsTable, setupGamesTable, offerTable, offerDetailsTable, usersTable, setupConfigurationsTable } from './schema.js';
+import { addOnsTable, gamesTable, setupsTable, setupGamesTable, offerTable, offerDetailsTable, usersTable, setupConfigurationsTable } from './schema.js';
 import { eq } from 'drizzle-orm';
 import { hashPassword } from './../../middlewares/auth.js';
 
@@ -132,7 +132,78 @@ async function seed() {
     }
   }
 
-  // 2. Seed Setup Configurations & Setup Instances
+  // 2. Seed add-on catalog
+  const addOnsList = [
+    {
+      itemName: 'Coke',
+      price: 20,
+      quantity: 250,
+      quantityUnit: 'ml',
+      imageUrl: 'https://www.bbassets.com/media/uploads/p/xxl/94411-2_2-coca-cola-soft-drink.jpg'
+    },
+    {
+      itemName: 'Fanta',
+      price: 20,
+      quantity: 250,
+      quantityUnit: 'ml',
+      imageUrl: 'https://www.bbassets.com/media/uploads/p/xl/412247_1-fanta-orange.jpg'
+    },
+    {
+      itemName: 'Sprite',
+      price: 20,
+      quantity: 250,
+      quantityUnit: 'ml',
+      imageUrl: 'https://m.media-amazon.com/images/I/61GrMnZ1AOL.jpg'
+    },
+    {
+      itemName: 'Appy',
+      price: 20,
+      quantity: 250,
+      quantityUnit: 'ml',
+      imageUrl: 'https://neelamfoodlandmumbai.com/cdn/shop/files/23026_2.jpg?v=1776703446&width=1445'
+    },
+    {
+      itemName: 'Water Bottle 500 ml',
+      price: 10,
+      quantity: 500,
+      quantityUnit: 'ml',
+      imageUrl: 'https://5.imimg.com/data5/GM/LA/MY-30050015/bisleri-mineral-water.jpg'
+    },
+    {
+      itemName: 'Water Bottle 1 litre',
+      price: 20,
+      quantity: 1,
+      quantityUnit: 'litre',
+      imageUrl: 'https://5.imimg.com/data5/RH/UE/MY-10548700/bisleri-mineral-water-500x500.jpg'
+    }
+  ];
+
+  console.log('Inserting/updating add-ons...');
+  for (const addOn of addOnsList) {
+    const [existing] = await db
+      .select({ id: addOnsTable.id })
+      .from(addOnsTable)
+      .where(eq(addOnsTable.itemName, addOn.itemName));
+
+    if (existing) {
+      await db
+        .update(addOnsTable)
+        .set({
+          ...addOn,
+          isActive: true,
+          updatedAt: new Date()
+        })
+        .where(eq(addOnsTable.id, existing.id));
+      console.log(`Updated add-on "${addOn.itemName}"`);
+    } else {
+      await db
+        .insert(addOnsTable)
+        .values({ ...addOn, isActive: true });
+      console.log(`Inserted add-on "${addOn.itemName}"`);
+    }
+  }
+
+  // 3. Seed Setup Configurations & Setup Instances
   const configurationsList = [
     {
       name: 'Big Screen (65")',
