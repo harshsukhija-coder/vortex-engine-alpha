@@ -9,6 +9,10 @@ const envSchema = z.object({
   DB_PASSWORD: z.string().optional(),
   DB_NAME: z.string().optional(),
   DB_PORT: z.string().optional(),
+  AUTO_ADJUST_TERMINATION_END_TIME: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default(
     process.env.VERCEL ? "info" : "debug"
   )

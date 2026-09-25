@@ -27,7 +27,7 @@ import {
   getBookingAddOnSummary,
   resolveAddOnLines
 } from '../core/add-ons.js';
-import { floorBillableMinutes } from '../core/billing-duration.js';
+import { resolveTerminationTiming } from '../core/termination-timing.js';
 
 const api = new Hono();
 
@@ -2469,28 +2469,39 @@ async function handleEndSessionLogic(params: {
     throw new Error("Invalid actual start time");
   }
   // Booking requests use minute precision, so persist termination at the same precision.
-  const actualEndTime = requestedActualEndTime
+  const requestedEndTime = requestedActualEndTime
     ? new Date(requestedActualEndTime)
     : new Date(now);
   if (!requestedActualEndTime) {
-    actualEndTime.setSeconds(0, 0);
+    requestedEndTime.setSeconds(0, 0);
   }
-  if (Number.isNaN(actualEndTime.getTime())) {
+  if (Number.isNaN(requestedEndTime.getTime())) {
     throw new Error("Invalid actual end time");
   }
-  if (actualEndTime <= actualStartTime) {
+  if (requestedEndTime <= actualStartTime) {
     throw new Error("Cannot terminate a session before it starts");
   }
-  if (actualEndTime > now) {
+  if (requestedEndTime > now) {
     throw new Error("Actual end time cannot be in the future");
   }
 
-  // Floor each hour's remainder into 0, 15, or 30 billable minutes.
-  const elapsedMs = Math.max(0, actualEndTime.getTime() - actualStartTime.getTime());
-  const elapsedMinutes = Math.floor(elapsedMs / (1000 * 60));
-  const roundedMinutes = floorBillableMinutes(elapsedMs);
-  const actualDurationHours = roundedMinutes / 60;
-  const scheduledDurationHours = booking.requestedNoOfHours || Math.round((new Date(booking.endTime).getTime() - actualStartTime.getTime()) / (1000 * 60 * 60) * 100) / 100;
+  const scheduledDurationHours = booking.requestedNoOfHours
+    || Math.round(
+      (
+        new Date(booking.endTime).getTime()
+        - new Date(booking.startTime).getTime()
+      ) / (1000 * 60 * 60) * 100
+    ) / 100;
+  const terminationTiming = resolveTerminationTiming({
+    actualStartTime,
+    requestedEndTime,
+    scheduledDurationHours,
+    autoAdjustEndTime: env.AUTO_ADJUST_TERMINATION_END_TIME
+  });
+  const actualEndTime = terminationTiming.effectiveEndTime;
+  const elapsedMinutes = terminationTiming.elapsedMinutes;
+  const roundedMinutes = terminationTiming.billedMinutes;
+  const actualDurationHours = terminationTiming.billedHours;
 
   // Recalculate gameplay amount for actual duration. Add-ons are never discounted.
   const finalGameplayOriginalAmount = Math.ceil(
@@ -2752,16 +2763,16 @@ async function calculateTerminationPreview(
   const actualStartTime = input.actualStartTime
     ? new Date(input.actualStartTime)
     : new Date(booking.actualStartTime ?? booking.startTime);
-  const actualEndTime = input.actualEndTime
+  const requestedEndTime = input.actualEndTime
     ? new Date(input.actualEndTime)
     : new Date(now);
   if (!input.actualEndTime) {
-    actualEndTime.setSeconds(0, 0);
+    requestedEndTime.setSeconds(0, 0);
   }
-  if (actualEndTime <= actualStartTime) {
+  if (requestedEndTime <= actualStartTime) {
     throw new Error("Actual end time must be after the session start time");
   }
-  if (actualEndTime > now) {
+  if (requestedEndTime > now) {
     throw new Error("Actual end time cannot be in the future");
   }
 
@@ -2782,13 +2793,21 @@ async function calculateTerminationPreview(
   const ratePerPersonPerHour = playersCount === 1
     ? singlePlayerPrice
     : multiplayerPrice;
-  const elapsedMs = Math.max(
-    0,
-    actualEndTime.getTime() - actualStartTime.getTime()
-  );
-  const elapsedMinutes = Math.floor(elapsedMs / 60_000);
-  const billedMinutes = floorBillableMinutes(elapsedMs);
-  const billedHours = billedMinutes / 60;
+  const scheduledDurationHours = booking.requestedNoOfHours
+    || Math.round(
+      (
+        new Date(booking.endTime).getTime()
+        - new Date(booking.startTime).getTime()
+      ) / (1000 * 60 * 60) * 100
+    ) / 100;
+  const terminationTiming = resolveTerminationTiming({
+    actualStartTime,
+    requestedEndTime,
+    scheduledDurationHours,
+    autoAdjustEndTime: env.AUTO_ADJUST_TERMINATION_END_TIME
+  });
+  const billedMinutes = terminationTiming.billedMinutes;
+  const billedHours = terminationTiming.billedHours;
   const gameplayOriginalAmount = Math.ceil(
     billedHours * ratePerPersonPerHour * playersCount
   );
@@ -2858,8 +2877,9 @@ async function calculateTerminationPreview(
       canTerminateAtProposedTime: true,
       startedAt: actualStartTime.toISOString(),
       actualStartTime: actualStartTime.toISOString(),
-      proposedEndTime: actualEndTime.toISOString(),
-      elapsedMinutes,
+      proposedEndTime:
+        terminationTiming.effectiveEndTime.toISOString(),
+      elapsedMinutes: terminationTiming.elapsedMinutes,
       billedMinutes,
       billedHours
     },
