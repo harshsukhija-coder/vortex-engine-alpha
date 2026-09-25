@@ -2472,9 +2472,6 @@ async function handleEndSessionLogic(params: {
   const requestedEndTime = requestedActualEndTime
     ? new Date(requestedActualEndTime)
     : new Date(now);
-  if (!requestedActualEndTime) {
-    requestedEndTime.setSeconds(0, 0);
-  }
   if (Number.isNaN(requestedEndTime.getTime())) {
     throw new Error("Invalid actual end time");
   }
@@ -2766,9 +2763,6 @@ async function calculateTerminationPreview(
   const requestedEndTime = input.actualEndTime
     ? new Date(input.actualEndTime)
     : new Date(now);
-  if (!input.actualEndTime) {
-    requestedEndTime.setSeconds(0, 0);
-  }
   if (requestedEndTime <= actualStartTime) {
     throw new Error("Actual end time must be after the session start time");
   }
