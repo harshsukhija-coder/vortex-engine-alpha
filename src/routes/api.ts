@@ -2475,7 +2475,7 @@ async function handleEndSessionLogic(params: {
   if (Number.isNaN(requestedEndTime.getTime())) {
     throw new Error("Invalid actual end time");
   }
-  if (requestedEndTime <= actualStartTime) {
+  if (requestedEndTime < actualStartTime) {
     throw new Error("Cannot terminate a session before it starts");
   }
   if (requestedEndTime > now) {
@@ -2763,8 +2763,8 @@ async function calculateTerminationPreview(
   const requestedEndTime = input.actualEndTime
     ? new Date(input.actualEndTime)
     : new Date(now);
-  if (requestedEndTime <= actualStartTime) {
-    throw new Error("Actual end time must be after the session start time");
+  if (requestedEndTime < actualStartTime) {
+    throw new Error("Actual end time cannot be before the session start time");
   }
   if (requestedEndTime > now) {
     throw new Error("Actual end time cannot be in the future");
@@ -3004,7 +3004,7 @@ api.get(
         } catch (error: unknown) {
           if (
             error instanceof Error
-            && error.message === "Actual end time must be after the session start time"
+            && error.message === "Actual end time cannot be before the session start time"
           ) {
             checkoutPreviewError = {
               code: "END_TIME_NOT_AFTER_START",
