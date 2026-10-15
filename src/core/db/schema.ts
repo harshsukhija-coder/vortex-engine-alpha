@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, customType, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
+import { boolean, check, customType, date, doublePrecision, index, integer, jsonb, pgEnum, pgTable, primaryKey, text, time, timestamp, varchar } from "drizzle-orm/pg-core";
 
 const bytea = customType<{ data: Buffer; driverData: Buffer }>({
   dataType() {
@@ -310,6 +310,60 @@ export const customersTable = pgTable("customers", {
   createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
 });
+
+// Free-visit reward codes. A code is generated once a customer has enough
+// approved visits inside the reward window; it can be redeemed once and
+// expires a fixed number of days after creation.
+export const visitRewardCodesTable = pgTable("visit_reward_codes", {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  phoneNumber: varchar("phone_number", { length: 20 }).notNull(),
+  code: varchar({ length: 32 }).notNull().unique(),
+  expiresAt: timestamp("expires_at", { precision: 6, withTimezone: true }).notNull(),
+  redeemedAt: timestamp("redeemed_at", { precision: 6, withTimezone: true }),
+  redeemedBy: integer("redeemed_by").references(() => usersTable.id, {
+    onDelete: "set null"
+  }),
+  redeemedBookingId: integer("redeemed_booking_id").references(() => bookingTable.id, {
+    onDelete: "set null"
+  }),
+  createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
+}, (table) => ({
+  phoneIdx: index("visit_reward_codes_phone_idx").on(table.phoneNumber)
+}));
+
+// Customer visit claims. A visit counts towards a reward only once an admin
+// approves it; `isUsed` flips to true when the visit is consumed by a reward
+// code so it can never be counted again.
+export const visitRewardsTable = pgTable("visit_rewards", {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  phoneNumber: varchar("phone_number", { length: 20 }).notNull(),
+  name: varchar({ length: 255 }).notNull(),
+  dateOfVisit: date("date_of_visit", { mode: "string" }).notNull(), // IST calendar day
+  isUsed: boolean("is_used").notNull().default(false),
+  isApproved: boolean("is_approved").notNull().default(false),
+  approvedBy: integer("approved_by").references(() => usersTable.id, {
+    onDelete: "set null"
+  }),
+  approvedAt: timestamp("approved_at", { precision: 6, withTimezone: true }),
+  rewardCodeId: integer("reward_code_id").references(() => visitRewardCodesTable.id, {
+    onDelete: "set null"
+  }),
+  createdAt: timestamp("created_at", { precision: 6, withTimezone: true }).notNull().defaultNow()
+}, (table) => ({
+  // TEMP: one-claim-per-customer-per-day is disabled for testing. To restore,
+  // make this a uniqueIndex again and re-add the duplicate check in
+  // requestVisit().
+  phoneDateIdx: index("visit_rewards_phone_date_idx").on(
+    table.phoneNumber,
+    table.dateOfVisit
+  ),
+  eligibilityIdx: index("visit_rewards_eligibility_idx").on(
+    table.phoneNumber,
+    table.isApproved,
+    table.isUsed,
+    table.dateOfVisit
+  )
+}));
 
 // One opening electricity meter reading per IST calendar day
 export const dailyMeterReadingsTable = pgTable("daily_meter_readings", {

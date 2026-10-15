@@ -28,6 +28,15 @@ import {
   resolveAddOnLines
 } from '../core/add-ons.js';
 import { resolveTerminationTiming } from '../core/termination-timing.js';
+import {
+  calculateCouponDiscount,
+  getBookingCouponCount,
+  MAX_COUPON_CODES_PER_REQUEST,
+  normalizeCouponCodes,
+  redeemCouponsForBooking,
+  validateCoupons,
+  VisitRewardError
+} from '../core/visit-rewards.js';
 
 const api = new Hono();
 
@@ -170,8 +179,15 @@ const bookingPayloadSchema = z.object({
   upiAmount: z.number().nonnegative().optional()
 });
 
+// Free-visit coupon codes (admin only): one coupon per player, at most.
+const couponCodesSchema = z
+  .array(z.string().trim().min(1).max(32))
+  .max(MAX_COUPON_CODES_PER_REQUEST)
+  .optional();
+
 const actualBookingSchema = bookingPayloadSchema.extend({
-  setupInstanceId: z.number().int().positive("Invalid setup instance ID")
+  setupInstanceId: z.number().int().positive("Invalid setup instance ID"),
+  couponCodes: couponCodesSchema
 });
 
 const tentativeBookingSchema = bookingPayloadSchema.extend({
@@ -397,6 +413,10 @@ const tentativeOfferEvaluationSchema = z.object({
   appliedOfferIds: z.array(z.number().int().positive()).optional()
 });
 
+const actualEvaluationSchema = actualReviewSchema.extend({
+  couponCodes: couponCodesSchema
+});
+
 // Helper function to evaluate promotional offers (including Play 2 Get 1 Free and Happy Hours)
 function evaluatePromotions(params: {
   setup: { id: number; name: string; consoleType: string; price: number; singlePlayerPrice?: number | null; multiplayerPrice?: number | null };
@@ -478,8 +498,11 @@ function evaluatePromotions(params: {
   const offers = [offer1, offer2];
   const applicableOffers = offers.filter((o) => o.eligible);
   const ineligibleOffers = offers.filter((o) => !o.eligible);
+  // Offers are opt-in: an eligible offer is only applied when it was explicitly
+  // selected. Eligible-but-unselected offers stay in `applicableOffers` so the
+  // admin can choose them, but never reduce the amount.
   const selectedOffers = applicableOffers.filter(
-    (offer) => !selectedOfferIds || selectedOfferIds.includes(offer.id)
+    (offer) => selectedOfferIds?.includes(offer.id) ?? false
   );
   const appliedOffers = selectedOffers
     .sort((a, b) => b.discount - a.discount)
@@ -504,7 +527,7 @@ function evaluatePromotions(params: {
 async function handleOffersEvaluation(c: any) {
   try {
     const body = await c.req.json();
-    const validated = actualReviewSchema.safeParse(body);
+    const validated = actualEvaluationSchema.safeParse(body);
     if (!validated.success) {
       return c.json({ success: false, error: "Validation failed", details: validated.error.format() }, 400);
     }
@@ -557,6 +580,15 @@ async function handleOffersEvaluation(c: any) {
       selectedOfferIds: data.appliedOfferIds
     });
 
+    // Optional free-visit coupons (one per player at most)
+    const couponCodes = normalizeCouponCodes(data.couponCodes, playersCount);
+    await validateCoupons(couponCodes);
+    const couponDiscount = calculateCouponDiscount(
+      evaluation.totalAmount,
+      playersCount,
+      couponCodes.length
+    );
+
     return c.json({
       success: true,
       evaluated: true,
@@ -577,8 +609,16 @@ async function handleOffersEvaluation(c: any) {
         ratePerPersonPerHour: pricing.ratePerPersonPerHour,
         calculationFormula: pricing.calculationFormula,
         originalAmount: evaluation.originalAmount,
-        discountApplied: evaluation.discountApplied,
-        totalAmount: evaluation.totalAmount
+        offerDiscount: evaluation.discountApplied,
+        couponDiscount,
+        discountApplied: evaluation.discountApplied + couponDiscount,
+        totalAmount: evaluation.totalAmount - couponDiscount
+      },
+      coupons: {
+        codes: couponCodes,
+        count: couponCodes.length,
+        maxAllowed: playersCount,
+        discount: couponDiscount
       },
       appliedOffers: evaluation.appliedOffers,
       applicableOffers: evaluation.offers.filter((offer) => offer.eligible),
@@ -586,6 +626,9 @@ async function handleOffersEvaluation(c: any) {
       offers: evaluation.offers
     });
   } catch (error: any) {
+    if (error instanceof VisitRewardError) {
+      return c.json({ success: false, error: error.message }, error.status);
+    }
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);
   }
@@ -930,9 +973,21 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
       durationHours,
       selectedOfferIds
     });
-    const discountApplied = offerEvaluation.discountApplied;
+    // Free-visit coupons: one per player at most, each frees one player's share
+    // of the gameplay. Codes are validated here for clear errors and redeemed
+    // atomically with the booking below.
+    const couponCodes = normalizeCouponCodes(data.couponCodes, count);
+    await validateCoupons(couponCodes);
+    const couponDiscount = calculateCouponDiscount(
+      offerEvaluation.totalAmount,
+      count,
+      couponCodes.length
+    );
+    const offerDiscount = offerEvaluation.discountApplied;
+    const discountApplied = offerDiscount + couponDiscount;
+    const gameplayTotalAmount = offerEvaluation.totalAmount - couponDiscount;
     const originalAmount = pricing.basePrice + addOnSelection.total;
-    const amountCharged = offerEvaluation.totalAmount + addOnSelection.total;
+    const amountCharged = gameplayTotalAmount + addOnSelection.total;
     const appliedOffers = offerEvaluation.appliedOffers;
 
     // Payment amounts
@@ -965,6 +1020,7 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     };
 
     // 5. Database transaction to check overlap and create confirmed booking
+    let redeemedCoupons: Awaited<ReturnType<typeof redeemCouponsForBooking>> = [];
     const booking = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(${setupInstanceId})`);
 
@@ -978,21 +1034,8 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
         );
       }
 
-      // 5a. Check existing booking overlap (confirmed)
-      const [existingBooking] = await tx
-        .select()
-        .from(bookingTable)
-        .where(
-          and(
-            eq(bookingTable.setupId, setupInstanceId),
-            lt(bookingTable.startTime, maxEnd),
-            gt(bookingTable.endTime, minStart),
-            ne(bookingTable.status, 'CANCELLED')
-          )
-        );
-      if (existingBooking) {
-        throw new Error(`The requested interval (${startTime} for ${noOfHours} hours) overlaps with an existing confirmed booking.`);
-      }
+      // 5a. Overlapping bookings on the same setup are intentionally allowed.
+      //     (The previous-session-terminated check above still applies.)
 
       // 5b. Create the booking entry (associating with userId and tracking admin bookedBy)
       const [insertedBooking] = await tx
@@ -1016,6 +1059,15 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           setupSnapshot
         })
         .returning();
+
+      // 5b-2. Redeem the coupons for this booking (rolls back everything if any
+      // code was used or expired in the meantime)
+      redeemedCoupons = await redeemCouponsForBooking(
+        tx,
+        couponCodes,
+        insertedBooking.id,
+        adminId ?? null
+      );
 
       // 5c. Clear temporary slot lock if lockToken was provided
       if (lockToken) {
@@ -1142,15 +1194,22 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           playerType: pricing.playerType,
           calculationFormula: pricing.calculationFormula,
           gameplayOriginalAmount: pricing.basePrice,
-          gameplayTotalAmount: offerEvaluation.totalAmount,
+          gameplayTotalAmount,
           addOnsTotal: addOnSelection.total,
           originalAmount,
+          offerDiscount,
+          couponDiscount,
           discountApplied,
           totalAmount: amountCharged,
           cashAmount: booking.cashAmount,
           upiAmount: booking.upiAmount
         },
         addOns: addOnSelection.lines,
+        coupons: redeemedCoupons.map((coupon) => ({
+          code: coupon.code,
+          phoneNumber: coupon.phoneNumber,
+          redeemedAt: coupon.redeemedAt
+        })),
         appliedOffers,
         applicableOffers: offerEvaluation.offers.filter((offer) => offer.eligible),
         ineligibleOffers: offerEvaluation.offers.filter((offer) => !offer.eligible),
@@ -1164,6 +1223,9 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
       }
     });
   } catch (error: any) {
+    if (error instanceof VisitRewardError) {
+      return c.json({ success: false, error: error.message }, error.status);
+    }
     console.error(error);
     if (error instanceof SessionTerminationRequiredError) {
       return c.json({ success: false, error: error.message }, 409);
@@ -1534,22 +1596,7 @@ api.post('/bookings/tentative/:id/confirm', authMiddleware, requireRole(['ADMIN'
         throw new Error("Invalid start or end time specified");
       }
 
-      // 2. Check overlapping confirmed bookings
-      const [overlappingBooking] = await tx
-        .select()
-        .from(bookingTable)
-        .where(
-          and(
-            eq(bookingTable.setupId, setupInstanceId),
-            lt(bookingTable.startTime, finalEndTime),
-            gt(bookingTable.endTime, finalStartTime),
-            ne(bookingTable.status, 'CANCELLED')
-          )
-        );
-
-      if (overlappingBooking) {
-        throw new Error("Cannot confirm: The requested slot overlaps with an existing confirmed booking.");
-      }
+      // 2. Overlapping bookings on the same setup are intentionally allowed.
 
       const finalAmountCharged = tentative.amountCharged || 0;
       const cashAmount = requestedCashAmount
@@ -2053,6 +2100,12 @@ api.get(
         return c.json({ success: false, error: "Setup instance not found" }, 404);
       }
 
+      const existingOfferIds = (
+        await db
+          .select({ offerId: bookingAndOffersTable.offerId })
+          .from(bookingAndOffersTable)
+          .where(eq(bookingAndOffersTable.bookingId, booking.id))
+      ).map((row) => row.offerId);
       const offerEvaluation = evaluatePromotions({
         setup: {
           id: Number(snapshot.setupConfigurationId ?? setupInstance.setupConfigurationId),
@@ -2072,12 +2125,19 @@ api.get(
           hour12: true,
           timeZone: 'Asia/Kolkata'
         }),
-        durationHours: totalDurationHours
+        durationHours: totalDurationHours,
+        // Keep the offers already applied to this booking
+        selectedOfferIds: existingOfferIds
       });
 
+      const couponDiscount = calculateCouponDiscount(
+        offerEvaluation.totalAmount,
+        playersCount,
+        await getBookingCouponCount(booking.id)
+      );
       const previousTotalAmount = booking.amountCharged ?? 0;
       const extendedTotalAmount =
-        offerEvaluation.totalAmount + addOnSummary.total;
+        offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
       const additionalAmountToPay = Math.max(
         0,
         extendedTotalAmount - previousTotalAmount
@@ -2137,11 +2197,13 @@ api.get(
           pricing: {
             ratePerPersonPerHour,
             gameplayOriginalAmount: offerEvaluation.originalAmount,
-            gameplayTotalAmount: offerEvaluation.totalAmount,
+            gameplayTotalAmount: offerEvaluation.totalAmount - couponDiscount,
             addOnsTotal: addOnSummary.total,
             originalAmount:
               offerEvaluation.originalAmount + addOnSummary.total,
-            discountApplied: offerEvaluation.discountApplied,
+            offerDiscount: offerEvaluation.discountApplied,
+            couponDiscount,
+            discountApplied: offerEvaluation.discountApplied + couponDiscount,
             totalAmount: extendedTotalAmount,
             previousTotalAmount,
             additionalAmountToPay
@@ -2224,8 +2286,16 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
       totalDurationHours * ratePerPersonPerHour * count
     );
     const newOriginalAmount = newGameplayOriginalAmount + addOnSummary.total;
+    // Offers stay as they are on the booking unless the request changes them
+    const existingOfferIds = (
+      await db
+        .select({ offerId: bookingAndOffersTable.offerId })
+        .from(bookingAndOffersTable)
+        .where(eq(bookingAndOffersTable.bookingId, booking.id))
+    ).map((row) => row.offerId);
     const targetOfferIds = data.offers?.appliedOfferIds
-      ?? data.appliedOfferIds;
+      ?? data.appliedOfferIds
+      ?? existingOfferIds;
     const offerEvaluation = evaluatePromotions({
       setup: {
         id: Number(snapshot.setupConfigurationId ?? setupId),
@@ -2244,13 +2314,17 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
         timeZone: 'Asia/Kolkata'
       }),
       durationHours: totalDurationHours,
-      selectedOfferIds: targetOfferIds && targetOfferIds.length > 0
-        ? targetOfferIds
-        : undefined
+      selectedOfferIds: targetOfferIds
     });
     const appliedOffers = offerEvaluation.appliedOffers;
-    const discountApplied = offerEvaluation.discountApplied;
-    const newTotalAmount = offerEvaluation.totalAmount + addOnSummary.total;
+    const couponDiscount = calculateCouponDiscount(
+      offerEvaluation.totalAmount,
+      count,
+      await getBookingCouponCount(booking.id)
+    );
+    const discountApplied = offerEvaluation.discountApplied + couponDiscount;
+    const newTotalAmount =
+      offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
     const previousTotalAmount = booking.amountCharged || 0;
     const additionalAmountToPay = Math.max(0, newTotalAmount - previousTotalAmount);
 
@@ -2364,9 +2438,11 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
         previousOriginalAmount: booking.originalAmount,
         previousTotalAmount,
         newGameplayOriginalAmount,
-        newGameplayTotalAmount: offerEvaluation.totalAmount,
+        newGameplayTotalAmount: offerEvaluation.totalAmount - couponDiscount,
         addOnsTotal: addOnSummary.total,
         newOriginalAmount,
+        offerDiscount: offerEvaluation.discountApplied,
+        couponDiscount,
         discountApplied,
         newTotalAmount,
         additionalAmountToPay
@@ -2478,9 +2554,6 @@ async function handleEndSessionLogic(params: {
   if (requestedEndTime < actualStartTime) {
     throw new Error("Cannot terminate a session before it starts");
   }
-  if (requestedEndTime > now) {
-    throw new Error("Actual end time cannot be in the future");
-  }
 
   const scheduledDurationHours = booking.requestedNoOfHours
     || Math.round(
@@ -2530,16 +2603,20 @@ async function handleEndSessionLogic(params: {
       timeZone: 'Asia/Kolkata'
     }),
     durationHours: actualDurationHours,
-    selectedOfferIds: existingBookingOffers.length > 0
-      ? existingBookingOffers.map((offer) => offer.offerId)
-      : undefined
+    selectedOfferIds: existingBookingOffers.map((offer) => offer.offerId)
   });
 
   const appliedOffers = offerEvaluation.appliedOffers;
   const finalOriginalAmount =
     finalGameplayOriginalAmount + addOnSummary.total;
+  // Coupons redeemed at booking time keep their players free for the billed session
+  const couponDiscount = calculateCouponDiscount(
+    offerEvaluation.totalAmount,
+    count,
+    await getBookingCouponCount(booking.id)
+  );
   const calculatedAmountCharged =
-    offerEvaluation.totalAmount + addOnSummary.total;
+    offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
   const finalAmountCharged =
     requestedFinalAmountCharged ?? calculatedAmountCharged;
   const discountApplied = Math.max(0, finalOriginalAmount - finalAmountCharged);
@@ -2676,6 +2753,8 @@ async function handleEndSessionLogic(params: {
         calculationFormula: `Gameplay ₹${finalGameplayOriginalAmount} + add-ons ₹${addOnSummary.total} = ₹${finalOriginalAmount}`,
         gameplayOriginalAmount: finalGameplayOriginalAmount,
         gameplayAmountAfterOffers: offerEvaluation.totalAmount,
+        couponDiscount,
+        gameplayAmountAfterCoupons: offerEvaluation.totalAmount - couponDiscount,
         addOnsTotal: addOnSummary.total,
         originalAmount: finalOriginalAmount,
         calculatedAmountCharged,
@@ -2766,9 +2845,6 @@ async function calculateTerminationPreview(
   if (requestedEndTime < actualStartTime) {
     throw new Error("Actual end time cannot be before the session start time");
   }
-  if (requestedEndTime > now) {
-    throw new Error("Actual end time cannot be in the future");
-  }
 
   const snapshot = (booking.setupSnapshot as Record<string, unknown> | null) ?? {};
   const playersCount = booking.count || 1;
@@ -2833,13 +2909,16 @@ async function calculateTerminationPreview(
       timeZone: 'Asia/Kolkata'
     }),
     durationHours: billedHours,
-    selectedOfferIds: existingBookingOffers.length > 0
-      ? existingBookingOffers.map((offer) => offer.offerId)
-      : undefined
+    selectedOfferIds: existingBookingOffers.map((offer) => offer.offerId)
   });
 
+  const couponDiscount = calculateCouponDiscount(
+    offerEvaluation.totalAmount,
+    playersCount,
+    await getBookingCouponCount(booking.id)
+  );
   const calculatedAmountCharged =
-    offerEvaluation.totalAmount + addOnSummary.total;
+    offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
   const totalPayable =
     input.finalAmountCharged ?? calculatedAmountCharged;
   const previousCashAmount = booking.cashAmount ?? 0;
@@ -2883,8 +2962,11 @@ async function calculateTerminationPreview(
         (booking.originalAmount ?? 0) - addOnSummary.total
       ),
       originalAmount: gameplayOriginalAmount,
-      discountApplied: offerEvaluation.discountApplied,
-      amountAfterOffers: offerEvaluation.totalAmount
+      discountApplied: offerEvaluation.discountApplied + couponDiscount,
+      offerDiscount: offerEvaluation.discountApplied,
+      couponDiscount,
+      amountAfterOffers: offerEvaluation.totalAmount,
+      amountAfterCoupons: offerEvaluation.totalAmount - couponDiscount
     },
     addOns: {
       items: addOnSummary.items,
@@ -2901,7 +2983,7 @@ async function calculateTerminationPreview(
       amountAdjustedManually: input.finalAmountCharged !== undefined,
       totalPayable,
       calculationFormula:
-        `Gameplay ₹${offerEvaluation.totalAmount} + add-ons ₹${addOnSummary.total} = ₹${totalPayable}`,
+        `Gameplay ₹${offerEvaluation.totalAmount - couponDiscount} + add-ons ₹${addOnSummary.total} = ₹${totalPayable}`,
       cashAmount,
       upiAmount,
       paymentRecorded,
@@ -3248,7 +3330,12 @@ api.post('/bookings/:id/apply-discount', authMiddleware, requireRole(['ADMIN', '
       durationHours,
       selectedOfferIds: offerIds
     });
-    const amountCharged = offerEvaluation.totalAmount;
+    const couponDiscount = calculateCouponDiscount(
+      offerEvaluation.totalAmount,
+      count,
+      await getBookingCouponCount(id)
+    );
+    const amountCharged = offerEvaluation.totalAmount - couponDiscount;
     const appliedPromotions = offerEvaluation.appliedOffers;
 
     // 3. Write updates inside transaction

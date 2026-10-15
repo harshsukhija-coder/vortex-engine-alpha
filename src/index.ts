@@ -10,6 +10,7 @@ import analytics from './routes/analytics.js'
 import auth from './routes/auth.js'
 import meterReadings from './routes/meter-readings.js'
 import schedule from './routes/schedule.js'
+import visitRewards from './routes/visit-rewards.js'
 
 export const app = new Hono()
   .use(pinoLogger({ pino: { level: env.LOG_LEVEL } }))
@@ -21,6 +22,7 @@ app.route('/api', analytics)
 app.route('/api', auth)
 app.route('/api', meterReadings)
 app.route('/api', schedule)
+app.route('/api', visitRewards)
 
 app.get('/', (c) => {
   return c.text('Hello Hono!');
