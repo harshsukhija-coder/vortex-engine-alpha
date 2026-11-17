@@ -570,7 +570,9 @@ async function handleOffersEvaluation(c: any) {
       multiplayerPrice: config.multiplayerPrice ?? config.price
     };
 
-    const pricing = calculatePriceForRule(config, playersCount, durationHours);
+    const gameIds = bDetails.gameIds ?? data.gameIds ?? (bDetails.games?.map((g: any) => g.id)) ?? [];
+    const selectedGames = await resolveSelectedGames(gameIds);
+    const pricing = calculatePriceForRule(config, playersCount, durationHours, selectedGames);
     const evaluation = evaluatePromotions({
       setup,
       playersCount,
@@ -588,6 +590,8 @@ async function handleOffersEvaluation(c: any) {
       playersCount,
       couponCodes.length
     );
+    // Game premiums stay outside offer/coupon discounts.
+    const totalAmount = evaluation.totalAmount - couponDiscount + pricing.gamesTotal;
 
     return c.json({
       success: true,
@@ -607,12 +611,18 @@ async function handleOffersEvaluation(c: any) {
         startTime: startTimeStr,
         noOfHours: durationHours,
         ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+        setupPrice: pricing.setupPrice,
+        gamesTotal: pricing.gamesTotal,
+        games: pricing.selectedGames,
         calculationFormula: pricing.calculationFormula,
-        originalAmount: evaluation.originalAmount,
+        setupFormula: pricing.setupFormula,
+        gamesFormula: pricing.gamesFormula,
+        originalAmount: evaluation.originalAmount + pricing.gamesTotal,
         offerDiscount: evaluation.discountApplied,
         couponDiscount,
         discountApplied: evaluation.discountApplied + couponDiscount,
-        totalAmount: evaluation.totalAmount - couponDiscount
+        gameplayAfterOffers: evaluation.totalAmount,
+        totalAmount
       },
       coupons: {
         codes: couponCodes,
@@ -667,10 +677,12 @@ api.post('/offers/evaluate', async (c) => {
       );
     }
 
+    const selectedGames = await resolveSelectedGames(data.gameIds ?? []);
     const pricing = calculatePriceForRule(
       config,
       data.playersCount,
-      data.noOfHours
+      data.noOfHours,
+      selectedGames
     );
     const evaluation = evaluatePromotions({
       setup: {
@@ -687,6 +699,8 @@ api.post('/offers/evaluate', async (c) => {
       durationHours: data.noOfHours,
       selectedOfferIds: data.appliedOfferIds
     });
+    // Game premiums are flat add-ons and are not reduced by offers.
+    const totalAmount = evaluation.totalAmount + pricing.gamesTotal;
 
     return c.json({
       success: true,
@@ -704,10 +718,17 @@ api.post('/offers/evaluate', async (c) => {
         startTime: data.startTime,
         noOfHours: data.noOfHours,
         ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+        setupPrice: pricing.setupPrice,
+        gamesTotal: pricing.gamesTotal,
+        games: pricing.selectedGames,
         calculationFormula: pricing.calculationFormula,
-        originalAmount: evaluation.originalAmount,
+        setupFormula: pricing.setupFormula,
+        gamesFormula: pricing.gamesFormula,
+        originalAmount: evaluation.originalAmount + pricing.gamesTotal,
+        offerDiscount: evaluation.discountApplied,
         discountApplied: evaluation.discountApplied,
-        totalAmount: evaluation.totalAmount
+        gameplayAfterOffers: evaluation.totalAmount,
+        totalAmount
       },
       appliedOffers: evaluation.appliedOffers,
       applicableOffers: evaluation.offers.filter((offer) => offer.eligible),
@@ -802,12 +823,8 @@ api.post('/bookings/review', async (c) => {
       formattedSlotStrings.push(`${startStr} - ${endStr}`);
     }
 
-    const selectedGames = gameIds.length === 0
-      ? []
-      : await db
-        .select({ id: gamesTable.id, name: gamesTable.name })
-        .from(gamesTable)
-        .where(inArray(gamesTable.id, gameIds));
+    const selectedGames = await resolveSelectedGames(gameIds);
+    const pricing = calculatePriceForRule(config, count, noOfHours, selectedGames);
     const selectedOffers = HARDCODED_OFFERS.filter((offer) =>
       appliedOfferIds.includes(offer.id)
     );
@@ -828,9 +845,22 @@ api.post('/bookings/review', async (c) => {
         slots: formattedSlotStrings,
         playersCount: count,
         durationHours: noOfHours,
-        games: selectedGames,
+        games: pricing.selectedGames,
+        gamesTotal: pricing.gamesTotal,
         addOns: addOnSelection.lines,
         addOnsTotal: addOnSelection.total,
+        pricing: {
+          ratePerPersonPerHour: pricing.ratePerPersonPerHour,
+          playerType: pricing.playerType,
+          setupPrice: pricing.setupPrice,
+          gamesTotal: pricing.gamesTotal,
+          addOnsTotal: addOnSelection.total,
+          basePrice: pricing.basePrice,
+          totalAmount: pricing.basePrice + addOnSelection.total,
+          calculationFormula: pricing.calculationFormula,
+          setupFormula: pricing.setupFormula,
+          gamesFormula: pricing.gamesFormula
+        },
         selectedOffers
       }
     });
@@ -950,7 +980,8 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     const maxEnd = new Date(minStart.getTime() + noOfHours * 60 * 60 * 1000);
     const durationHours = noOfHours;
 
-    const pricing = calculatePriceForRule(config, count, durationHours);
+    const selectedGamesForPricing = await resolveSelectedGames(gameIds);
+    const pricing = calculatePriceForRule(config, count, durationHours, selectedGamesForPricing);
     const ratePerPersonPerHour = pricing.ratePerPersonPerHour;
     const addOnSelection = await resolveAddOnLines(
       bDetails.addOns ?? data.addOns ?? []
@@ -985,7 +1016,9 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     );
     const offerDiscount = offerEvaluation.discountApplied;
     const discountApplied = offerDiscount + couponDiscount;
-    const gameplayTotalAmount = offerEvaluation.totalAmount - couponDiscount;
+    // Game premiums stay outside offer/coupon discounts.
+    const gameplayTotalAmount =
+      offerEvaluation.totalAmount - couponDiscount + pricing.gamesTotal;
     const originalAmount = pricing.basePrice + addOnSelection.total;
     const amountCharged = gameplayTotalAmount + addOnSelection.total;
     const appliedOffers = offerEvaluation.appliedOffers;
@@ -1159,7 +1192,11 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
     let gamesList: any[] = [];
     if (gameIds && gameIds.length > 0) {
       const dbGames = await db.select().from(gamesTable);
-      gamesList = dbGames.filter(g => gameIds.includes(g.id)).map(g => ({ id: g.id, name: g.name }));
+      gamesList = dbGames.filter(g => gameIds.includes(g.id)).map(g => ({
+        id: g.id,
+        name: g.name,
+        price: g.price ?? 0
+      }));
     }
 
     return c.json({
@@ -1194,6 +1231,8 @@ api.post('/bookings', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN']), asy
           playerType: pricing.playerType,
           calculationFormula: pricing.calculationFormula,
           gameplayOriginalAmount: pricing.basePrice,
+          setupPrice: pricing.setupPrice,
+          gamesTotal: pricing.gamesTotal,
           gameplayTotalAmount,
           addOnsTotal: addOnSelection.total,
           originalAmount,
@@ -1286,7 +1325,8 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
       return c.json({ success: false, error: "Setup configuration not found or is currently not active" }, 404);
     }
 
-    const pricing = calculatePriceForRule(config, count, noOfHours);
+    const selectedGamesForPricing = await resolveSelectedGames(gameIds);
+    const pricing = calculatePriceForRule(config, count, noOfHours, selectedGamesForPricing);
 
     const minStart = parseTimeToDate(date, startTime);
     const maxEnd = new Date(minStart.getTime() + noOfHours * 60 * 60 * 1000);
@@ -1313,7 +1353,7 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
       selectedOfferIds: appliedOfferIds
     });
     const originalAmount = pricing.basePrice + addOnSelection.total;
-    const amountCharged = offerEvaluation.totalAmount + addOnSelection.total;
+    const amountCharged = offerEvaluation.totalAmount + pricing.gamesTotal + addOnSelection.total;
     const appliedOffers = offerEvaluation.appliedOffers;
 
     // 4. Build setup snapshot
@@ -1386,8 +1426,11 @@ api.post('/bookings/tentative', authMiddleware, requireRole(['ADMIN', 'SUPER_ADM
           ratePerPersonPerHour: pricing.ratePerPersonPerHour,
           playerType: pricing.playerType,
           calculationFormula: pricing.calculationFormula,
+          setupPrice: pricing.setupPrice,
+          gamesTotal: pricing.gamesTotal,
+          games: pricing.selectedGames,
           gameplayOriginalAmount: pricing.basePrice,
-          gameplayTotalAmount: offerEvaluation.totalAmount,
+          gameplayTotalAmount: offerEvaluation.totalAmount + pricing.gamesTotal,
           addOnsTotal: addOnSelection.total,
           originalAmount,
           discountApplied: offerEvaluation.discountApplied,
@@ -2065,7 +2108,7 @@ api.get(
             .where(eq(customersTable.phoneNumber, booking.phoneNumber))
             .then((rows) => rows[0]),
           db
-            .select({ id: gamesTable.id, name: gamesTable.name })
+            .select({ id: gamesTable.id, name: gamesTable.name, price: gamesTable.price })
             .from(bookingAndGames)
             .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
             .where(eq(bookingAndGames.bookingId, booking.id)),
@@ -2135,9 +2178,14 @@ api.get(
         playersCount,
         await getBookingCouponCount(booking.id)
       );
+      const gamesTotal = games.reduce(
+        (sum, game) => sum + Math.max(0, Math.ceil(Number(game.price ?? 0) || 0)),
+        0
+      );
       const previousTotalAmount = booking.amountCharged ?? 0;
+      // Game premiums are flat and do not scale with extension hours.
       const extendedTotalAmount =
-        offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
+        offerEvaluation.totalAmount - couponDiscount + addOnSummary.total + gamesTotal;
       const additionalAmountToPay = Math.max(
         0,
         extendedTotalAmount - previousTotalAmount
@@ -2196,11 +2244,13 @@ api.get(
           totalDurationHours,
           pricing: {
             ratePerPersonPerHour,
-            gameplayOriginalAmount: offerEvaluation.originalAmount,
-            gameplayTotalAmount: offerEvaluation.totalAmount - couponDiscount,
+            setupPrice: offerEvaluation.originalAmount,
+            gamesTotal,
+            gameplayOriginalAmount: offerEvaluation.originalAmount + gamesTotal,
+            gameplayTotalAmount: offerEvaluation.totalAmount - couponDiscount + gamesTotal,
             addOnsTotal: addOnSummary.total,
             originalAmount:
-              offerEvaluation.originalAmount + addOnSummary.total,
+              offerEvaluation.originalAmount + addOnSummary.total + gamesTotal,
             offerDiscount: offerEvaluation.discountApplied,
             couponDiscount,
             discountApplied: offerEvaluation.discountApplied + couponDiscount,
@@ -2323,8 +2373,18 @@ api.post('/bookings/:id/extend', authMiddleware, requireRole(['ADMIN', 'SUPER_AD
       await getBookingCouponCount(booking.id)
     );
     const discountApplied = offerEvaluation.discountApplied + couponDiscount;
+    const bookedGames = await db
+      .select({ id: gamesTable.id, name: gamesTable.name, price: gamesTable.price })
+      .from(bookingAndGames)
+      .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+      .where(eq(bookingAndGames.bookingId, booking.id));
+    const gamesTotal = bookedGames.reduce(
+      (sum, game) => sum + Math.max(0, Math.ceil(Number(game.price ?? 0) || 0)),
+      0
+    );
+    // Game premiums are flat and do not scale with extension hours.
     const newTotalAmount =
-      offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
+      offerEvaluation.totalAmount - couponDiscount + addOnSummary.total + gamesTotal;
     const previousTotalAmount = booking.amountCharged || 0;
     const additionalAmountToPay = Math.max(0, newTotalAmount - previousTotalAmount);
 
@@ -4185,6 +4245,20 @@ api.get('/customers/lookup', authMiddleware, requireRole(['ADMIN', 'SUPER_ADMIN'
   }
 });
 
+
+async function resolveSelectedGames(gameIds: number[] = []) {
+  const uniqueIds = [...new Set(gameIds.filter((id) => Number.isInteger(id) && id > 0))];
+  if (uniqueIds.length === 0) return [];
+  return db
+    .select({
+      id: gamesTable.id,
+      name: gamesTable.name,
+      price: gamesTable.price
+    })
+    .from(gamesTable)
+    .where(inArray(gamesTable.id, uniqueIds));
+}
+
 // Helper function to parse session duration flexibly (handles numbers in hours/minutes, strings like "90m", "1.5h", etc.)
 function parseSessionDurationInput(rawDuration: any, rawHours?: any, rawMinutes?: any): number {
   if (rawHours !== undefined && rawHours !== null && rawHours !== '') {
@@ -4215,7 +4289,14 @@ function parseSessionDurationInput(rawDuration: any, rawHours?: any, rawMinutes?
 }
 
 // Price Calculation Handler logic
-async function handlePriceCalculation(c: any, input: { setupConfigurationId?: any; noOfPlayers?: any; sessionDuration?: any; noOfHours?: any; durationMinutes?: any }) {
+async function handlePriceCalculation(c: any, input: {
+  setupConfigurationId?: any;
+  noOfPlayers?: any;
+  sessionDuration?: any;
+  noOfHours?: any;
+  durationMinutes?: any;
+  gameIds?: any;
+}) {
   const setupConfigurationIdRaw = input.setupConfigurationId;
   if (!setupConfigurationIdRaw) {
     return c.json({ success: false, error: 'setupConfigurationId is required' }, 400);
@@ -4231,6 +4312,14 @@ async function handlePriceCalculation(c: any, input: { setupConfigurationId?: an
     : 1;
 
   const durationHours = parseSessionDurationInput(input.sessionDuration, input.noOfHours, input.durationMinutes);
+  const rawGameIds = Array.isArray(input.gameIds)
+    ? input.gameIds
+    : typeof input.gameIds === 'string' && input.gameIds.trim()
+      ? input.gameIds.split(',')
+      : [];
+  const gameIds = rawGameIds
+    .map((id: any) => parseInt(String(id), 10))
+    .filter((id: number) => Number.isInteger(id) && id > 0);
 
   const [config] = await db
     .select()
@@ -4241,7 +4330,12 @@ async function handlePriceCalculation(c: any, input: { setupConfigurationId?: an
     return c.json({ success: false, error: 'Setup configuration not found' }, 404);
   }
 
-  const result = calculatePriceForRule(config, players, durationHours);
+  const selectedGames = await resolveSelectedGames(gameIds);
+  if (gameIds.length > 0 && selectedGames.length !== [...new Set(gameIds)].length) {
+    return c.json({ success: false, error: 'One or more selected games were not found' }, 404);
+  }
+
+  const result = calculatePriceForRule(config, players, durationHours, selectedGames);
 
   return c.json({
     success: true,
@@ -4254,8 +4348,13 @@ async function handlePriceCalculation(c: any, input: { setupConfigurationId?: an
       noOfPlayers: players,
       sessionDurationHours: durationHours,
       ratePerPersonPerHour: result.ratePerPersonPerHour,
+      setupPrice: result.setupPrice,
+      gamesTotal: result.gamesTotal,
+      games: result.selectedGames,
       basePrice: result.basePrice,
-      calculationFormula: result.calculationFormula
+      calculationFormula: result.calculationFormula,
+      setupFormula: result.setupFormula,
+      gamesFormula: result.gamesFormula
     }
   });
 }
@@ -4269,8 +4368,9 @@ api.post('/price', async (c) => {
     const sessionDuration = body.sessionDuration ?? body.session_duration ?? body.duration ?? body.noOfHours ?? body.durationHours;
     const noOfHours = body.noOfHours ?? body.durationHours;
     const durationMinutes = body.durationMinutes ?? body.session_duration_minutes;
+    const gameIds = body.gameIds ?? body.game_ids ?? body.games?.map((g: any) => g.id);
 
-    return await handlePriceCalculation(c, { setupConfigurationId, noOfPlayers, sessionDuration, noOfHours, durationMinutes });
+    return await handlePriceCalculation(c, { setupConfigurationId, noOfPlayers, sessionDuration, noOfHours, durationMinutes, gameIds });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);
@@ -4285,8 +4385,9 @@ api.get('/price', async (c) => {
     const sessionDuration = c.req.query('sessionDuration') || c.req.query('session_duration') || c.req.query('duration') || c.req.query('noOfHours');
     const noOfHours = c.req.query('noOfHours') || c.req.query('durationHours');
     const durationMinutes = c.req.query('durationMinutes');
+    const gameIds = c.req.query('gameIds') || c.req.query('game_ids');
 
-    return await handlePriceCalculation(c, { setupConfigurationId, noOfPlayers, sessionDuration, noOfHours, durationMinutes });
+    return await handlePriceCalculation(c, { setupConfigurationId, noOfPlayers, sessionDuration, noOfHours, durationMinutes, gameIds });
   } catch (error: any) {
     console.error(error);
     return c.json({ success: false, error: error.message }, 500);

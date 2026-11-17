@@ -54,6 +54,15 @@ async function seed() {
       ]
     },
     {
+      name: 'GTA 6',
+      price: 149,
+      isActive: true,
+      images: [
+        'https://www.igrandtheftauto.com/content/images/large/gta-vi-key-3840x2160.jpg',
+        'https://i.ytimg.com/vi/QdBZY2fkU-0/maxresdefault.jpg'
+      ]
+    },
+    {
       name: 'Uncharted',
       price: 0,
       isActive: true,
@@ -108,10 +117,11 @@ async function seed() {
       .where(eq(gamesTable.name, game.name));
 
     if (existing.length > 0) {
-      console.log(`Game "${game.name}" already exists — updating images...`);
+      console.log(`Game "${game.name}" already exists — updating images/price...`);
       await db
         .update(gamesTable)
         .set({
+          price: game.price,
           images: game.images,
           updatedAt: new Date()
         })
@@ -210,9 +220,9 @@ async function seed() {
       description: 'Featuring a big 65" screen setup equipped with PS5 consoles, comfortable chairs, high-end controllers, and immersive sound.',
       consoleType: 'PS5',
       screenType: '65 inch Sansui',
-      price: 120,
-      singlePlayerPrice: 120,
-      multiplayerPrice: 100,
+      price: 150,
+      singlePlayerPrice: 150,
+      multiplayerPrice: 120,
       isActive: true,
       extendedConfigurations: {
         headphones: 'Sony WH-CH520 Wireless',

@@ -27,6 +27,21 @@ const details: OfferDetailRecord[] = [
 
 const bigScreen = { price: 150, singlePlayerPrice: 150, multiplayerPrice: 120 };
 assert.equal(calculatePriceForRule(bigScreen, 1, 2).basePrice, 300);
+assert.equal(calculatePriceForRule(bigScreen, 1, 2).setupPrice, 300);
+assert.equal(calculatePriceForRule(bigScreen, 1, 2).gamesTotal, 0);
+
+const withGames = calculatePriceForRule(
+  bigScreen,
+  1,
+  2,
+  [
+    { id: 1, name: 'FC 26', price: 50 },
+    { id: 2, name: 'Tekken8', price: 0 }
+  ]
+);
+assert.equal(withGames.setupPrice, 300);
+assert.equal(withGames.gamesTotal, 50);
+assert.equal(withGames.basePrice, 350);
 
 const threePlayerPrice = calculatePriceForRule(bigScreen, 3, 2);
 assert.equal(threePlayerPrice.ratePerPersonPerHour, 120);

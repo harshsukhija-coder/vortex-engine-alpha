@@ -1,9 +1,12 @@
 import { Hono } from 'hono';
-import { and, asc, eq, gt, inArray, lt } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, lt, ne, sql } from 'drizzle-orm';
 import * as z from 'zod';
 import { db } from '../core/db/index.js';
 import {
+  bookingAndGames,
+  bookingSlotsTable,
   bookingTable,
+  gamesTable,
   setupConfigurationsTable,
   setupsTable,
   slotLocksTable,
@@ -11,6 +14,7 @@ import {
 } from '../core/db/schema.js';
 import { getOperatingSlots } from '../core/schedule.js';
 import { addDaysIst, formatIstTime, parseTimeToDate, todayIst } from '../core/time.js';
+import { authMiddleware, requireRole } from '../middlewares/auth.js';
 
 const schedule = new Hono();
 
@@ -21,11 +25,34 @@ const querySchema = z.object({
   view: z.enum(['upcoming', 'grid']).optional().default('upcoming')
 });
 
+const updateUpcomingSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  startTime: z.string().min(1).optional(),
+  noOfHours: z.number().positive().max(12).optional(),
+  playersCount: z.number().int().positive().max(20).optional(),
+  phoneNumber: z.string().trim().min(8).max(20).optional(),
+  setupInstanceId: z.number().int().positive().optional()
+}).refine(
+  (data) =>
+    data.date !== undefined ||
+    data.startTime !== undefined ||
+    data.noOfHours !== undefined ||
+    data.playersCount !== undefined ||
+    data.phoneNumber !== undefined ||
+    data.setupInstanceId !== undefined,
+  { message: 'Provide at least one field to update' }
+);
+
 interface ConfigurationInterval {
   startTime: Date;
   endTime: Date;
   setupConfigurationId: number;
   status: 'BOOKED' | 'TENTATIVE' | 'LOCKED';
+}
+
+function parseBookingId(value: string): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
 }
 
 async function loadOccupied(
@@ -90,6 +117,40 @@ async function loadOccupied(
   ];
 }
 
+async function toUpcomingItem(booking: typeof bookingTable.$inferSelect) {
+  const [setup] = booking.setupId
+    ? await db.select().from(setupsTable).where(eq(setupsTable.id, booking.setupId))
+    : [];
+  const [config] = setup
+    ? await db
+      .select()
+      .from(setupConfigurationsTable)
+      .where(eq(setupConfigurationsTable.id, setup.setupConfigurationId))
+    : [];
+
+  return {
+    bookingId: booking.id,
+    status: booking.status,
+    setupInstanceId: booking.setupId,
+    setupConfigurationId: config?.id ?? null,
+    setupName: config?.name ?? null,
+    instanceName: setup?.name ?? null,
+    phoneNumber: booking.phoneNumber,
+    playersCount: booking.count,
+    date: booking.startTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
+    startTime: formatIstTime(booking.startTime),
+    endTime: formatIstTime(booking.endTime),
+    startTimeIso: booking.startTime.toISOString(),
+    endTimeIso: booking.endTime.toISOString(),
+    noOfHours: booking.requestedNoOfHours
+      ?? Math.round(
+        (booking.endTime.getTime() - booking.startTime.getTime()) / 3_600_000
+      ),
+    originalAmount: booking.originalAmount,
+    amountCharged: booking.amountCharged
+  };
+}
+
 schedule.get('/schedule', async (c) => {
   try {
     const parsed = querySchema.safeParse(c.req.query());
@@ -132,8 +193,10 @@ schedule.get('/schedule', async (c) => {
         return {
           bookingId: b.id,
           status: b.status,
+          setupInstanceId: b.setupId,
           setupConfigurationId: config?.id ?? null,
           setupName: config?.name ?? null,
+          instanceName: setup?.name ?? null,
           phoneNumber: b.phoneNumber,
           playersCount: b.count,
           date: b.startTime.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
@@ -141,6 +204,8 @@ schedule.get('/schedule', async (c) => {
           endTime: formatIstTime(b.endTime),
           startTimeIso: b.startTime.toISOString(),
           endTimeIso: b.endTime.toISOString(),
+          noOfHours: b.requestedNoOfHours
+            ?? Math.round((b.endTime.getTime() - b.startTime.getTime()) / 3_600_000),
           originalAmount: b.originalAmount,
           amountCharged: b.amountCharged
         };
@@ -239,5 +304,317 @@ schedule.get('/schedule', async (c) => {
     return c.json({ success: false, error: message }, 500);
   }
 });
+
+// PATCH /api/schedule/upcoming/:bookingId - Reschedule / edit an upcoming confirmed booking
+schedule.patch(
+  '/schedule/upcoming/:bookingId',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  async (c) => {
+    try {
+      const bookingId = parseBookingId(c.req.param('bookingId'));
+      if (!bookingId) {
+        return c.json({ success: false, error: 'Invalid booking ID' }, 400);
+      }
+
+      const parsed = updateUpcomingSchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        return c.json(
+          { success: false, error: 'Validation failed', details: parsed.error.format() },
+          400
+        );
+      }
+      const data = parsed.data;
+      const now = new Date();
+
+      const updated = await db.transaction(async (tx) => {
+        const [booking] = await tx
+          .select()
+          .from(bookingTable)
+          .where(eq(bookingTable.id, bookingId));
+
+        if (!booking) {
+          throw Object.assign(new Error('Booking not found'), { status: 404 });
+        }
+        if (booking.status !== 'CONFIRMED') {
+          throw Object.assign(
+            new Error('Only confirmed upcoming bookings can be updated from schedule'),
+            { status: 409 }
+          );
+        }
+        if (booking.startTime <= now) {
+          throw Object.assign(
+            new Error('Past or in-progress sessions cannot be edited from upcoming schedule'),
+            { status: 409 }
+          );
+        }
+        if (!booking.setupId && data.setupInstanceId === undefined) {
+          throw Object.assign(new Error('Booking has no setup instance assigned'), { status: 400 });
+        }
+
+        const setupInstanceId = data.setupInstanceId ?? booking.setupId!;
+        const [setupInstance] = await tx
+          .select()
+          .from(setupsTable)
+          .where(
+            and(
+              eq(setupsTable.id, setupInstanceId),
+              eq(setupsTable.isActive, true)
+            )
+          );
+        if (!setupInstance) {
+          throw Object.assign(new Error('Setup instance not found or inactive'), { status: 404 });
+        }
+
+        const currentDate = booking.startTime.toLocaleDateString('en-CA', {
+          timeZone: 'Asia/Kolkata'
+        });
+        const currentStartLabel = formatIstTime(booking.startTime);
+        const currentHours = booking.requestedNoOfHours
+          ?? Math.max(
+            0.25,
+            (booking.endTime.getTime() - booking.startTime.getTime()) / 3_600_000
+          );
+
+        const nextDate = data.date ?? currentDate;
+        const nextStartLabel = data.startTime ?? currentStartLabel;
+        const nextHours = data.noOfHours ?? currentHours;
+        const nextPlayers = data.playersCount ?? booking.count;
+        const nextPhone = data.phoneNumber ?? booking.phoneNumber;
+
+        const nextStart = parseTimeToDate(nextDate, nextStartLabel);
+        const nextEnd = new Date(nextStart.getTime() + nextHours * 3_600_000);
+        if (nextStart <= now) {
+          throw Object.assign(
+            new Error('Updated start time must be in the future'),
+            { status: 400 }
+          );
+        }
+
+        await tx.execute(sql`select pg_advisory_xact_lock(${setupInstanceId})`);
+
+        const [overlappingBooking] = await tx
+          .select({ id: bookingTable.id })
+          .from(bookingTable)
+          .where(
+            and(
+              eq(bookingTable.setupId, setupInstanceId),
+              lt(bookingTable.startTime, nextEnd),
+              gt(bookingTable.endTime, nextStart),
+              ne(bookingTable.status, 'CANCELLED'),
+              ne(bookingTable.id, bookingId)
+            )
+          );
+        if (overlappingBooking) {
+          throw Object.assign(
+            new Error(
+              `Updated slot overlaps another booking (#${overlappingBooking.id}) on this setup`
+            ),
+            { status: 409 }
+          );
+        }
+
+        const [overlappingLock] = await tx
+          .select({ id: slotLocksTable.id })
+          .from(slotLocksTable)
+          .where(
+            and(
+              eq(slotLocksTable.setupId, setupInstanceId),
+              lt(slotLocksTable.startTime, nextEnd),
+              gt(slotLocksTable.endTime, nextStart),
+              gt(slotLocksTable.lockedUntil, new Date())
+            )
+          );
+        if (overlappingLock) {
+          throw Object.assign(
+            new Error('Updated slot overlaps an active temporary lock'),
+            { status: 409 }
+          );
+        }
+
+        const snapshot = (booking.setupSnapshot as Record<string, any> | null) ?? {};
+        const [config] = await tx
+          .select()
+          .from(setupConfigurationsTable)
+          .where(eq(setupConfigurationsTable.id, setupInstance.setupConfigurationId));
+
+        const singleRate = Number(
+          snapshot.singlePlayerPrice
+          ?? config?.singlePlayerPrice
+          ?? snapshot.price
+          ?? config?.price
+          ?? 150
+        );
+        const multiRate = Number(
+          snapshot.multiplayerPrice
+          ?? config?.multiplayerPrice
+          ?? snapshot.price
+          ?? config?.price
+          ?? 120
+        );
+        const rate = nextPlayers === 1 ? singleRate : multiRate;
+
+        const games = await tx
+          .select({ price: gamesTable.price })
+          .from(bookingAndGames)
+          .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+          .where(eq(bookingAndGames.bookingId, bookingId));
+        const gamesTotal = games.reduce(
+          (sum, game) => sum + Math.max(0, Math.ceil(Number(game.price ?? 0) || 0)),
+          0
+        );
+
+        const timingOrPlayersChanged =
+          data.date !== undefined ||
+          data.startTime !== undefined ||
+          data.noOfHours !== undefined ||
+          data.playersCount !== undefined ||
+          data.setupInstanceId !== undefined;
+
+        const setupPrice = Math.ceil(nextHours * rate * nextPlayers);
+        const nextOriginalAmount = timingOrPlayersChanged
+          ? setupPrice + gamesTotal
+          : (booking.originalAmount ?? setupPrice + gamesTotal);
+        // Preserve any existing discount delta when only rescheduling.
+        const previousDiscount = Math.max(
+          0,
+          (booking.originalAmount ?? 0) - (booking.amountCharged ?? 0)
+        );
+        const nextAmountCharged = timingOrPlayersChanged
+          ? Math.max(0, nextOriginalAmount - previousDiscount)
+          : (booking.amountCharged ?? nextOriginalAmount);
+
+        const nextSnapshot = {
+          ...snapshot,
+          setupId: setupInstance.id,
+          instanceName: setupInstance.name,
+          setupConfigurationId: setupInstance.setupConfigurationId,
+          name: config?.name ?? snapshot.name,
+          consoleType: config?.consoleType ?? snapshot.consoleType,
+          price: config?.price ?? snapshot.price,
+          singlePlayerPrice: config?.singlePlayerPrice ?? snapshot.singlePlayerPrice,
+          multiplayerPrice: config?.multiplayerPrice ?? snapshot.multiplayerPrice,
+          chargePerPersonPerHour: rate,
+          snapshotAt: new Date().toISOString()
+        };
+
+        const [row] = await tx
+          .update(bookingTable)
+          .set({
+            phoneNumber: nextPhone,
+            setupId: setupInstanceId,
+            count: nextPlayers,
+            startTime: nextStart,
+            endTime: nextEnd,
+            requestedStartTime: nextStart,
+            requestedNoOfHours: nextHours,
+            actualStartTime: nextStart,
+            originalAmount: nextOriginalAmount,
+            amountCharged: nextAmountCharged,
+            setupSnapshot: nextSnapshot,
+            updatedAt: new Date()
+          })
+          .where(eq(bookingTable.id, bookingId))
+          .returning();
+
+        await tx
+          .delete(bookingSlotsTable)
+          .where(eq(bookingSlotsTable.bookingId, bookingId));
+
+        const slotCount = Math.max(1, Math.ceil(nextHours));
+        for (let i = 0; i < slotCount; i++) {
+          const slotStart = new Date(nextStart.getTime() + i * 3_600_000);
+          const slotEnd = new Date(
+            Math.min(nextStart.getTime() + (i + 1) * 3_600_000, nextEnd.getTime())
+          );
+          await tx.insert(bookingSlotsTable).values({
+            bookingId,
+            startTime: slotStart,
+            endTime: slotEnd
+          });
+        }
+
+        return row;
+      });
+
+      return c.json({
+        success: true,
+        message: 'Upcoming booking updated',
+        upcoming: await toUpcomingItem(updated)
+      });
+    } catch (error: unknown) {
+      const status = typeof error === 'object' && error && 'status' in error
+        ? Number((error as { status?: number }).status) || 500
+        : 500;
+      const message = error instanceof Error ? error.message : 'Failed to update upcoming booking';
+      if (status >= 500) console.error(error);
+      return c.json({ success: false, error: message }, status as 400 | 404 | 409 | 500);
+    }
+  }
+);
+
+// DELETE /api/schedule/upcoming/:bookingId - Cancel an upcoming confirmed booking
+schedule.delete(
+  '/schedule/upcoming/:bookingId',
+  authMiddleware,
+  requireRole(['ADMIN', 'SUPER_ADMIN']),
+  async (c) => {
+    try {
+      const bookingId = parseBookingId(c.req.param('bookingId'));
+      if (!bookingId) {
+        return c.json({ success: false, error: 'Invalid booking ID' }, 400);
+      }
+
+      const now = new Date();
+      const [booking] = await db
+        .select()
+        .from(bookingTable)
+        .where(eq(bookingTable.id, bookingId));
+
+      if (!booking) {
+        return c.json({ success: false, error: 'Booking not found' }, 404);
+      }
+      if (booking.status !== 'CONFIRMED') {
+        return c.json(
+          { success: false, error: 'Only confirmed upcoming bookings can be deleted from schedule' },
+          409
+        );
+      }
+      if (booking.startTime <= now) {
+        return c.json(
+          {
+            success: false,
+            error: 'Past or in-progress sessions cannot be deleted from upcoming schedule'
+          },
+          409
+        );
+      }
+
+      const [cancelled] = await db
+        .update(bookingTable)
+        .set({
+          status: 'CANCELLED',
+          updatedAt: new Date()
+        })
+        .where(eq(bookingTable.id, bookingId))
+        .returning();
+
+      return c.json({
+        success: true,
+        message: 'Upcoming booking cancelled',
+        upcoming: await toUpcomingItem(cancelled)
+      });
+    } catch (error: unknown) {
+      console.error(error);
+      return c.json(
+        {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to delete upcoming booking'
+        },
+        500
+      );
+    }
+  }
+);
 
 export default schedule;
