@@ -2633,18 +2633,32 @@ async function handleEndSessionLogic(params: {
   const roundedMinutes = terminationTiming.billedMinutes;
   const actualDurationHours = terminationTiming.billedHours;
 
-  // Recalculate gameplay amount for actual duration. Add-ons are never discounted.
-  const finalGameplayOriginalAmount = Math.ceil(
+  // Recalculate setup gameplay for actual duration. Game premiums + add-ons are flat.
+  const setupGameplayAmount = Math.ceil(
     actualDurationHours * ratePerPersonPerHour * count
   );
 
-  const [existingBookingOffers, addOnSummary] = await Promise.all([
+  const [existingBookingOffers, addOnSummary, selectedGames] = await Promise.all([
     db
       .select({ offerId: bookingAndOffersTable.offerId })
       .from(bookingAndOffersTable)
       .where(eq(bookingAndOffersTable.bookingId, booking.id)),
-    getBookingAddOnSummary(booking.id)
+    getBookingAddOnSummary(booking.id),
+    db
+      .select({
+        id: gamesTable.id,
+        name: gamesTable.name,
+        price: gamesTable.price
+      })
+      .from(bookingAndGames)
+      .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+      .where(eq(bookingAndGames.bookingId, booking.id))
   ]);
+  const gamesTotal = selectedGames.reduce(
+    (sum, game) => sum + Math.max(0, Math.ceil(Number(game.price ?? 0) || 0)),
+    0
+  );
+  const finalGameplayOriginalAmount = setupGameplayAmount + gamesTotal;
   const offerEvaluation = evaluatePromotions({
     setup: {
       id: Number(snapshot.setupConfigurationId ?? booking.setupId ?? 0),
@@ -2676,7 +2690,7 @@ async function handleEndSessionLogic(params: {
     await getBookingCouponCount(booking.id)
   );
   const calculatedAmountCharged =
-    offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
+    offerEvaluation.totalAmount - couponDiscount + addOnSummary.total + gamesTotal;
   const finalAmountCharged =
     requestedFinalAmountCharged ?? calculatedAmountCharged;
   const discountApplied = Math.max(0, finalOriginalAmount - finalAmountCharged);
@@ -2750,14 +2764,11 @@ async function handleEndSessionLogic(params: {
     .where(eq(customersTable.phoneNumber, booking.phoneNumber));
 
   // Fetch games played
-  const dbGames = await db
-    .select({
-      id: gamesTable.id,
-      name: gamesTable.name
-    })
-    .from(bookingAndGames)
-    .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
-    .where(eq(bookingAndGames.bookingId, booking.id));
+  const dbGames = selectedGames.map((game) => ({
+    id: game.id,
+    name: game.name,
+    price: Math.max(0, Math.ceil(Number(game.price ?? 0) || 0))
+  }));
 
   // Fetch Admin who ended session
   const [adminUser] = adminId ? await db.select({ id: usersTable.id, email: usersTable.email, role: usersTable.role }).from(usersTable).where(eq(usersTable.id, adminId)) : [null];
@@ -2810,11 +2821,14 @@ async function handleEndSessionLogic(params: {
       },
       billing: {
         ratePerPersonPerHour,
-        calculationFormula: `Gameplay ₹${finalGameplayOriginalAmount} + add-ons ₹${addOnSummary.total} = ₹${finalOriginalAmount}`,
+        setupAmount: setupGameplayAmount,
+        gamesTotal,
+        calculationFormula: `Setup ₹${setupGameplayAmount} + games ₹${gamesTotal} + add-ons ₹${addOnSummary.total} = ₹${finalOriginalAmount}`,
         gameplayOriginalAmount: finalGameplayOriginalAmount,
         gameplayAmountAfterOffers: offerEvaluation.totalAmount,
         couponDiscount,
         gameplayAmountAfterCoupons: offerEvaluation.totalAmount - couponDiscount,
+        amountAfterGames: offerEvaluation.totalAmount - couponDiscount + gamesTotal,
         addOnsTotal: addOnSummary.total,
         originalAmount: finalOriginalAmount,
         calculatedAmountCharged,
@@ -2899,11 +2913,14 @@ async function calculateTerminationPreview(
   const actualStartTime = input.actualStartTime
     ? new Date(input.actualStartTime)
     : new Date(booking.actualStartTime ?? booking.startTime);
-  const requestedEndTime = input.actualEndTime
+  let requestedEndTime = input.actualEndTime
     ? new Date(input.actualEndTime)
     : new Date(now);
-  if (requestedEndTime < actualStartTime) {
-    throw new Error("Actual end time cannot be before the session start time");
+  // Always return a checkout preview for the UI. If "now" is before start
+  // (future-booked session opened early), clamp end to start so billed time is 0.
+  const endTimeBeforeStart = requestedEndTime < actualStartTime;
+  if (endTimeBeforeStart) {
+    requestedEndTime = new Date(actualStartTime);
   }
 
   const snapshot = (booking.setupSnapshot as Record<string, unknown> | null) ?? {};
@@ -2938,17 +2955,31 @@ async function calculateTerminationPreview(
   });
   const billedMinutes = terminationTiming.billedMinutes;
   const billedHours = terminationTiming.billedHours;
-  const gameplayOriginalAmount = Math.ceil(
+  const setupGameplayAmount = Math.ceil(
     billedHours * ratePerPersonPerHour * playersCount
   );
 
-  const [existingBookingOffers, addOnSummary] = await Promise.all([
+  const [existingBookingOffers, addOnSummary, selectedGames] = await Promise.all([
     db
       .select({ offerId: bookingAndOffersTable.offerId })
       .from(bookingAndOffersTable)
       .where(eq(bookingAndOffersTable.bookingId, booking.id)),
-    getBookingAddOnSummary(booking.id)
+    getBookingAddOnSummary(booking.id),
+    db
+      .select({
+        id: gamesTable.id,
+        name: gamesTable.name,
+        price: gamesTable.price
+      })
+      .from(bookingAndGames)
+      .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
+      .where(eq(bookingAndGames.bookingId, booking.id))
   ]);
+  const gamesTotal = selectedGames.reduce(
+    (sum, game) => sum + Math.max(0, Math.ceil(Number(game.price ?? 0) || 0)),
+    0
+  );
+  const gameplayOriginalAmount = setupGameplayAmount + gamesTotal;
   const offerEvaluation = evaluatePromotions({
     setup: {
       id: Number(snapshot.setupConfigurationId ?? booking.setupId ?? 0),
@@ -2977,8 +3008,9 @@ async function calculateTerminationPreview(
     playersCount,
     await getBookingCouponCount(booking.id)
   );
+  // Game premiums stay outside offer/coupon discounts.
   const calculatedAmountCharged =
-    offerEvaluation.totalAmount - couponDiscount + addOnSummary.total;
+    offerEvaluation.totalAmount - couponDiscount + addOnSummary.total + gamesTotal;
   const totalPayable =
     input.finalAmountCharged ?? calculatedAmountCharged;
   const previousCashAmount = booking.cashAmount ?? 0;
@@ -3006,27 +3038,39 @@ async function calculateTerminationPreview(
       playerType: playersCount === 1 ? "SINGLE_PLAYER" : "MULTIPLAYER"
     },
     timing: {
-      sessionStarted: true,
-      canTerminateAtProposedTime: true,
+      sessionStarted: !endTimeBeforeStart,
+      canTerminateAtProposedTime: !endTimeBeforeStart,
       startedAt: actualStartTime.toISOString(),
       actualStartTime: actualStartTime.toISOString(),
       proposedEndTime:
         terminationTiming.effectiveEndTime.toISOString(),
       elapsedMinutes: terminationTiming.elapsedMinutes,
       billedMinutes,
-      billedHours
+      billedHours,
+      endTimeClampedToStart: endTimeBeforeStart
+    },
+    games: {
+      items: selectedGames.map((game) => ({
+        id: game.id,
+        name: game.name,
+        price: Math.max(0, Math.ceil(Number(game.price ?? 0) || 0))
+      })),
+      total: gamesTotal
     },
     gameplay: {
       initialAmount: Math.max(
         0,
         (booking.originalAmount ?? 0) - addOnSummary.total
       ),
+      setupAmount: setupGameplayAmount,
+      gamesTotal,
       originalAmount: gameplayOriginalAmount,
       discountApplied: offerEvaluation.discountApplied + couponDiscount,
       offerDiscount: offerEvaluation.discountApplied,
       couponDiscount,
       amountAfterOffers: offerEvaluation.totalAmount,
-      amountAfterCoupons: offerEvaluation.totalAmount - couponDiscount
+      amountAfterCoupons: offerEvaluation.totalAmount - couponDiscount,
+      amountAfterGames: offerEvaluation.totalAmount - couponDiscount + gamesTotal
     },
     addOns: {
       items: addOnSummary.items,
@@ -3043,7 +3087,7 @@ async function calculateTerminationPreview(
       amountAdjustedManually: input.finalAmountCharged !== undefined,
       totalPayable,
       calculationFormula:
-        `Gameplay ₹${offerEvaluation.totalAmount - couponDiscount} + add-ons ₹${addOnSummary.total} = ₹${totalPayable}`,
+        `Setup ₹${offerEvaluation.totalAmount - couponDiscount} + games ₹${gamesTotal} + add-ons ₹${addOnSummary.total} = ₹${totalPayable}`,
       cashAmount,
       upiAmount,
       paymentRecorded,
@@ -3093,12 +3137,28 @@ api.get(
         return c.json({ success: false, error: "Setup instance not found" }, 404);
       }
 
-      const [previousSession] = await db
+      // Prefer the active confirmed session; fall back to latest booking.
+      const [activeSession] = await db
         .select()
         .from(bookingTable)
-        .where(eq(bookingTable.setupId, setupInstanceId))
+        .where(
+          and(
+            eq(bookingTable.setupId, setupInstanceId),
+            eq(bookingTable.status, 'CONFIRMED'),
+            isNull(bookingTable.actualEndTime)
+          )
+        )
         .orderBy(desc(bookingTable.createdAt))
         .limit(1);
+      const [latestSession] = activeSession
+        ? [activeSession]
+        : await db
+          .select()
+          .from(bookingTable)
+          .where(eq(bookingTable.setupId, setupInstanceId))
+          .orderBy(desc(bookingTable.createdAt))
+          .limit(1);
+      const previousSession = latestSession;
 
       const terminatedSuccessfully =
         setupInstance.previousSessionTerminatedSuccessfully;
@@ -3123,7 +3183,8 @@ api.get(
           db
             .select({
               id: gamesTable.id,
-              name: gamesTable.name
+              name: gamesTable.name,
+              price: gamesTable.price
             })
             .from(bookingAndGames)
             .innerJoin(gamesTable, eq(bookingAndGames.gameId, gamesTable.id))
@@ -3138,31 +3199,20 @@ api.get(
         proposedEndTime: string;
       } | null = null;
       if (canTerminate && previousSession) {
-        try {
-          checkoutPreview = await calculateTerminationPreview(
-            previousSession,
-            parsedQuery.data
-          );
-        } catch (error: unknown) {
-          if (
-            error instanceof Error
-            && error.message === "Actual end time cannot be before the session start time"
-          ) {
-            checkoutPreviewError = {
-              code: "END_TIME_NOT_AFTER_START",
-              message: error.message,
-              actualStartTime: new Date(
-                parsedQuery.data.actualStartTime
-                  ?? previousSession.actualStartTime
-                  ?? previousSession.startTime
-              ).toISOString(),
-              proposedEndTime: new Date(
-                parsedQuery.data.actualEndTime ?? Date.now()
-              ).toISOString()
-            };
-          } else {
-            throw error;
-          }
+        checkoutPreview = await calculateTerminationPreview(
+          previousSession,
+          parsedQuery.data
+        );
+        if (checkoutPreview.timing.endTimeClampedToStart) {
+          checkoutPreviewError = {
+            code: "END_TIME_NOT_AFTER_START",
+            message:
+              "Proposed end time is before session start. Pass actualStartTime if the session already started, or wait until the scheduled start.",
+            actualStartTime: checkoutPreview.timing.actualStartTime,
+            proposedEndTime: new Date(
+              parsedQuery.data.actualEndTime ?? Date.now()
+            ).toISOString()
+          };
         }
       }
 
@@ -3179,7 +3229,9 @@ api.get(
         requiresTermination: !terminatedSuccessfully,
         canTerminate,
         canTerminateWithProposedTime:
-          canTerminate && checkoutPreview !== null,
+          canTerminate
+          && checkoutPreview !== null
+          && checkoutPreview.timing.canTerminateAtProposedTime === true,
         acceptedAdjustments: {
           actualStartTime: "ISO-8601 query parameter, optional",
           actualEndTime: "ISO-8601 query parameter, optional; defaults to now",
